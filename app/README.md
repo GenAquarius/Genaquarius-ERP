@@ -1,5 +1,5 @@
 # GenAquarius Costing & Billing Platform
-
+ 
 Full-stack replacement for `Costing_FY26-27New.xlsm` — Node + React + MySQL.
 Every cost/invoice number is imported from the workbook's cached cells, so the
 data matches Excel with **zero deviation** (proven by `npm run reconcile`).
