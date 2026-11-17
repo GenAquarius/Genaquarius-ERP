@@ -434,6 +434,8 @@ async function ensureSchema() {
   await ensureColumn("Employee", "marriageAnniversary", "`marriageAnniversary` DATETIME(3) NULL");
   await ensureColumn("Employee", "emergencyContactName", "`emergencyContactName` VARCHAR(191) NULL");
   await ensureColumn("Employee", "emergencyContactPhone", "`emergencyContactPhone` VARCHAR(191) NULL");
+  await ensureColumn("Offer", "uanPfDetails", "`uanPfDetails` VARCHAR(191) NULL");
+  await ensureColumn("Employee", "uanPfDetails", "`uanPfDetails` VARCHAR(191) NULL");
   try {
     await prisma.$executeRawUnsafe(
       "CREATE TABLE IF NOT EXISTS `HrLeaveType` (" +

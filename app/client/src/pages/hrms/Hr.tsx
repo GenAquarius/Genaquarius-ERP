@@ -2021,6 +2021,7 @@ export function GenerateOffer() {
     candidateFirstName: "", candidateMiddleName: "", candidateLastName: "", candidateEmail: "", candidatePhone: "", candidateOfficialPhone: "", candidatePersonalEmail: "", candidateAddress: "", candidateCity: "", candidateLandmark: "", candidateState: "", candidatePincode: "", role: "", designation: "", employmentType: "EMPLOYEE", ctc: "", compensationType: "ANNUAL", compensationAmount: "", noCostToCompany: false,
     residentSameAsPermanent: true, residentAddress: "", residentCity: "", residentLandmark: "", residentState: "", residentPincode: "",
     gender: "", maritalStatus: "", dateOfBirth: "",
+    uanPfDetails: "", // UAN / PF Details (if applicable) — India Full-Time Employee only, optional
     businessUnitId: "", countryCode: "INDIA", offerDate: today, proposedJoiningDate: defaultJoining(today),
     reportingManager: "Sandeep Minocha", workLocation: "Office", department: "IT",
     probationPeriod: "2 Months", noticePeriod: "2 Months", acceptanceDeadline: defaultDeadline(today),
@@ -2089,6 +2090,7 @@ export function GenerateOffer() {
         residentSameAsPermanent: existing.residentSameAsPermanent !== false, residentAddress: existing.residentAddress || "", residentCity: existing.residentCity || "",
         residentLandmark: existing.residentLandmark || "", residentState: existing.residentState || "", residentPincode: existing.residentPincode || "",
         gender: existing.gender || "", maritalStatus: existing.maritalStatus || "", dateOfBirth: existing.dateOfBirth ? existing.dateOfBirth.slice(0, 10) : "",
+        uanPfDetails: existing.uanPfDetails || "",
         role: existing.role, designation: existing.designation, employmentType: existing.employmentType || "EMPLOYEE", ctc: String(existing.ctc), compensationType: existing.customFields?.compensationType || "ANNUAL", compensationAmount: existing.customFields?.compensationAmount != null ? String(existing.customFields.compensationAmount) : String(existing.ctc), noCostToCompany: !!existing.noCostToCompany,
         businessUnitId: existing.businessUnitId || "", countryCode: existing.countryCode,
         offerDate: existing.offerDate ? existing.offerDate.slice(0, 10) : "",
@@ -2192,6 +2194,8 @@ export function GenerateOffer() {
   // identity capture don't apply; a Vendor/Contractor engagement needs vendor fields instead of
   // (or in addition to) a flat CTC, feeding MsaSowAgreementPanel's MSA/SOW generation.
   const isUsCanada = f.countryCode === "US" || f.countryCode === "CANADA";
+  // UAN / PF Details — India entity, Full-Time Employee (Offer + Appointment Letter) only; optional.
+  const showUanPf = f.countryCode === "INDIA" && f.employmentType === "EMPLOYEE";
   // Contractor (India) compensation structure — Annual CTC / Monthly Salary / Daily Salary. The
   // annualized figure is kept in f.ctc so every existing validation/payload keeps working.
   const showCompStructure = f.employmentType === "CONTRACTOR" && !isUsCanada && !f.noCostToCompany;
@@ -2357,11 +2361,12 @@ export function GenerateOffer() {
             documentChecklist: f.documentChecklist || [],
             usEngagementType: f.usEngagementType || null, billingBasis: f.billingBasis || null,
             hourlyRateUsd: f.hourlyRateUsd === "" ? null : Number(f.hourlyRateUsd), hoursPerDay: f.hoursPerDay === "" ? null : Number(f.hoursPerDay), ...usCompPayload(),
+            ...(showUanPf ? { uanPfDetails: f.uanPfDetails || null } : {}),
           });
           show("New version generated"); navigate(`/hr/offers/${id}`);
         }
       } else {
-        const offer = await api.post("/hr/offers", { ...f, ...usCompPayload(), ctc: Number(f.ctc), ...(showCompStructure ? {} : { compensationType: undefined, compensationAmount: undefined }), businessUnitId: f.businessUnitId || null });
+        const offer = await api.post("/hr/offers", { ...f, ...usCompPayload(), uanPfDetails: showUanPf ? f.uanPfDetails : null, ctc: Number(f.ctc), ...(showCompStructure ? {} : { compensationType: undefined, compensationAmount: undefined }), businessUnitId: f.businessUnitId || null });
         // Upload resume/Aadhaar right after creation, still on this one submit — Offer Detail then
         // opens with both already on file, no separate upload step needed before Generate Offer.
         if (resumeFile) {
@@ -2569,6 +2574,10 @@ export function GenerateOffer() {
           )}
           <Field label="Offer Date" required type="date" value={f.offerDate} onChange={setOfferDate} />
           <Field label="Proposed Joining Date" required type="date" value={f.proposedJoiningDate} onChange={setJoining} />
+          {showUanPf && (
+            <Field label="UAN / PF Details (if applicable)" value={f.uanPfDetails} onChange={set("uanPfDetails")}
+              placeholder="e.g. UAN 100123456789 / PF No." maxLength={191} />
+          )}
         </div>
         {/* Vendor/Contractor engagement (US "Hired from Vendor" or Canada "Contractor") — these
             feed MsaSowAgreementPanel's MSA/SOW generation directly (Offer.vendorName etc.). */}

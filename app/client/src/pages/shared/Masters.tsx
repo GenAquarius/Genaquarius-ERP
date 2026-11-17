@@ -289,7 +289,7 @@ export function Employees() {
   // firstName/middleName/lastName are a FORM-ONLY convenience (mirrors the Offer form's own
   // candidateFirstName/Middle/Last split) — Employee.name stays the single source of truth in
   // the database; these three are joined into `name` right before every save (see save() below).
-  const blank = { id: null, name: "", firstName: "", middleName: "", lastName: "", empNo: "", empType: "FULL_TIME", location: "INDIA", joiningDate: "", email: "", designation: "", department: "", reportingManager: "", emergencyContactName: "", emergencyContactPhone: "", confidential: false, businessUnitId: "", noticePeriod: "2 Months", probationPeriod: "2 Months", workLocation: "Office", phone: "", officialPhone: "", personalEmail: "", gender: "", maritalStatus: "", marriageAnniversary: "", address: "", dateOfBirth: "", city: "", landmark: "", state: "", pincode: "", sameAsPermanent: true, residentAddress: "", residentCity: "", residentLandmark: "", residentState: "", residentPincode: "" };
+  const blank = { id: null, name: "", firstName: "", middleName: "", lastName: "", empNo: "", empType: "FULL_TIME", location: "INDIA", joiningDate: "", email: "", designation: "", department: "", reportingManager: "", emergencyContactName: "", emergencyContactPhone: "", uanPfDetails: "", confidential: false, businessUnitId: "", noticePeriod: "2 Months", probationPeriod: "2 Months", workLocation: "Office", phone: "", officialPhone: "", personalEmail: "", gender: "", maritalStatus: "", marriageAnniversary: "", address: "", dateOfBirth: "", city: "", landmark: "", state: "", pincode: "", sameAsPermanent: true, residentAddress: "", residentCity: "", residentLandmark: "", residentState: "", residentPincode: "" };
   // Best-effort split of a single `name` string back into first/middle/last for the edit form's
   // initial fill — a heuristic (first word / last word / anything between), never stored as such;
   // `name` itself remains untouched and authoritative everywhere else in the app.
@@ -444,6 +444,7 @@ export function Employees() {
             joiningDate: e.joiningDate?.slice(0, 10) || "", email: e.email || "",
             designation: e.designation || "", department: e.department || "", reportingManager: e.reportingManager || "",
             emergencyContactName: e.emergencyContactName || "", emergencyContactPhone: e.emergencyContactPhone || "",
+            uanPfDetails: e.uanPfDetails || "",
             confidential: !!e.confidential, businessUnitId: e.businessUnitId || "",
             noticePeriod: e.noticePeriod || "2 Months", probationPeriod: e.probationPeriod || "2 Months", workLocation: e.workLocation || "Office",
             phone: e.phone || "", officialPhone: e.officialPhone || "", personalEmail: e.personalEmail || "",
@@ -575,6 +576,7 @@ export function Employees() {
           <Input label="Marriage Anniversary" type="date" value={form.marriageAnniversary} onChange={(e: any) => setForm({ ...form, marriageAnniversary: e.target.value })} />
           <Input label="Emergency Contact Name" required={!form.id} value={form.emergencyContactName} onChange={(e: any) => setForm({ ...form, emergencyContactName: e.target.value })} />
           <Input label="Emergency Contact Number" required={!form.id} value={form.emergencyContactPhone} onChange={(e: any) => setForm({ ...form, emergencyContactPhone: e.target.value })} placeholder="e.g. +91 98765 43210" />
+          <Input label="UAN / PF Details (if applicable)" value={form.uanPfDetails} onChange={(e: any) => setForm({ ...form, uanPfDetails: e.target.value })} placeholder="e.g. UAN 100123456789 / PF No." maxLength={191} />
           <div className="full" style={{ fontWeight: 600, marginTop: 8 }}>Permanent Address</div>
           <Input label="Address Line" full value={form.address} onChange={(e: any) => setForm({ ...form, address: e.target.value })} placeholder="House / street / area" />
           <Input label="City" value={form.city} onChange={(e: any) => setForm({ ...form, city: e.target.value })} />

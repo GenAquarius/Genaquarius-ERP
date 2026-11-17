@@ -5,6 +5,7 @@
 import { Router, Request, Response, NextFunction } from "express";
 import { Role } from "@prisma/client";
 import { prisma } from "../../prisma";
+import { checklistTypesForEmployee, checklistTypesByNames, mergeChecklist, pendingTypes } from "../../engine/onboardingChecklist";
 import { requireRole, HR_SETTINGS_ROLES, ADMIN_ROLES } from "../../auth/auth";
 import { ctcAnnualUsd } from "../../engine/calc";
 import { mailEnabled } from "../../engine/mailer";
@@ -57,10 +58,13 @@ async function offerDocumentChecklist(employeeId: number): Promise<string[] | nu
 router.get("/pending-actions", requireEmployee, async (req, res) => {
   const employeeId = req.user!.employeeId!;
   const checklist = await offerDocumentChecklist(employeeId);
-  const docTypes = await prisma.onboardingDocumentType.findMany({ where: checklist !== null ? { name: { in: checklist } } : { required: true } });
-  const existingDocs = await prisma.employeeOnboardingDocument.findMany({ where: { employeeId } });
-  const byType = new Map(existingDocs.map((d) => [d.docTypeId, d]));
-  const pendingDocs = docTypes.filter((t) => { const d = byType.get(t.id); return !d || d.status === "PENDING" || d.status === "REJECTED"; });
+  // One type per document name (see engine/onboardingChecklist) — a file on either the global or
+  // the BU copy of a type counts, so already-uploaded documents never show as pending.
+  const docTypes = checklist !== null
+    ? await checklistTypesByNames(employeeId, checklist)
+    : (await checklistTypesForEmployee(employeeId)).filter((t) => t.required);
+  const existingDocs = await prisma.employeeOnboardingDocument.findMany({ where: { employeeId }, include: { docType: true } });
+  const pendingDocs = pendingTypes(docTypes, existingDocs);
   const timesheetActions = await prisma.employeeAction.findMany({ where: { employeeId, type: "TIMESHEET", status: "OPEN" }, orderBy: { assignedAt: "desc" } });
   // Derived, not a stored EmployeeAction row — HR doesn't necessarily know a candidate's wedding
   // anniversary at hiring time, so unlike Gender/Marital Status/DOB (captured at Offer Generation)
@@ -147,13 +151,12 @@ router.get("/me/appointment-pdf", requireEmployee, async (req, res) => {
 router.get("/onboarding-docs", requireEmployee, async (req, res) => {
   const employeeId = req.user!.employeeId!;
   const checklist = await offerDocumentChecklist(employeeId);
-  const allTypes = await prisma.onboardingDocumentType.findMany({ orderBy: { order: "asc" } });
   // Same checklist scoping as /pending-actions above — only list the document types HR actually
-  // selected on this person's own offer, not every type in the global master list.
-  const types = checklist !== null ? allTypes.filter((t) => checklist.includes(t.name)) : allTypes;
+  // selected on this person's own offer; otherwise their Business Unit's checklist (or the global
+  // default). One row per document name — see engine/onboardingChecklist.
+  const types = checklist !== null ? await checklistTypesByNames(employeeId, checklist) : await checklistTypesForEmployee(employeeId);
   const existing = await prisma.employeeOnboardingDocument.findMany({ where: { employeeId }, include: { docType: true } });
-  const byType = new Map(existing.map((d) => [d.docTypeId, d]));
-  res.json(types.map((t) => byType.get(t.id) || { id: null, employeeId, docTypeId: t.id, docType: t, fileName: null, status: "PENDING" }));
+  res.json(mergeChecklist(types, existing, employeeId));
 });
 
 router.post("/onboarding-docs/:docTypeId", requireEmployee, async (req, res) => {
@@ -292,10 +295,12 @@ router.get("/onboarding-docs/all", requireRole(...DOC_APPROVE_ROLES), async (_re
 });
 router.get("/onboarding-docs/employee/:employeeId", requireRole(...DOC_APPROVE_ROLES), async (req, res) => {
   const employeeId = Number(req.params.employeeId);
-  const types = await prisma.onboardingDocumentType.findMany({ orderBy: { order: "asc" } });
+  // Employee Master "View Documents" + Offer & Onboarding checklist. Used to list EVERY type row
+  // (global + each BU's clone) with a phantom PENDING row for each copy without a file — the
+  // "duplicate documents" bug. Now: this employee's applicable checklist, one row per name.
+  const types = await checklistTypesForEmployee(employeeId);
   const existing = await prisma.employeeOnboardingDocument.findMany({ where: { employeeId }, include: { docType: true } });
-  const byType = new Map(existing.map((d) => [d.docTypeId, d]));
-  res.json(types.map((t) => byType.get(t.id) || { id: null, employeeId, docTypeId: t.id, docType: t, fileName: null, status: "PENDING" }));
+  res.json(mergeChecklist(types, existing, employeeId));
 });
 router.put("/onboarding-docs/:id/review", requireRole(...DOC_APPROVE_ROLES), async (req, res) => {
   const { status, note } = req.body;

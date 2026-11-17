@@ -13,6 +13,7 @@ import { renderFnfPdf } from "../../engine/hrPdf";
 import { renderFnfDocxBuffer, fnfDocxFileName } from "../../engine/fnfDocx";
 import { emitHelpdeskUpdate, emitAttention } from "../../engine/realtime";
 import { fmtDate } from "../../engine/dateFormat";
+import { cleanUanPf } from "../../engine/uanPf";
 
 const router = Router();
 // Masters expose employees, CTC, salary and other confidential data — every route
@@ -133,6 +134,7 @@ router.post("/employees", requireAdmin, requirePermission("employees"), async (r
       residentAddress: residentAddress || null, residentCity: residentCity || null, residentLandmark: residentLandmark || null,
       residentState: residentState || null, residentPincode: residentPincode || null,
       dateOfBirth: dateOfBirth ? new Date(dateOfBirth) : null,
+      uanPfDetails: cleanUanPf(req.body.uanPfDetails) ?? null,
       projects: projectIds?.length ? { create: projectIds.map((id: number) => ({ projectId: id })) } : undefined,
     },
   });
@@ -240,6 +242,7 @@ router.put("/employees/:id", requireRole(...ADMIN_ROLES, Role.HR), requirePermis
       gender: gender !== undefined ? (gender || null) : undefined,
       maritalStatus: maritalStatus !== undefined ? (maritalStatus || null) : undefined,
       marriageAnniversary: marriageAnniversary !== undefined ? (marriageAnniversary ? new Date(marriageAnniversary) : null) : undefined,
+      uanPfDetails: cleanUanPf(req.body.uanPfDetails),
       address: address !== undefined ? (address || null) : undefined,
       city: city !== undefined ? (city || null) : undefined,
       landmark: landmark !== undefined ? (landmark || null) : undefined,

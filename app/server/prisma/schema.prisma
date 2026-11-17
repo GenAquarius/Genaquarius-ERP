@@ -663,6 +663,8 @@ model Employee {
   gender                String?
   maritalStatus         String?
   dateOfBirth           DateTime?
+  // UAN / PF Details (if applicable) — from the Offer at Confirm Joining, editable in Employee Master.
+  uanPfDetails          String?
   marriageAnniversary   DateTime?
   emergencyContactName  String?
   emergencyContactPhone String?
@@ -1634,6 +1636,9 @@ model Offer {
   gender              String?
   maritalStatus       String?
   dateOfBirth         DateTime?
+  // UAN / PF Details (if applicable) — optional, India full-time employees, Stage 1. Copied to
+  // Employee.uanPfDetails at Confirm Joining.
+  uanPfDetails        String?
   // Both mandatory before HR can generate the OFFER itself — see the guard in /offers/:id/generate.
   resumeFileName      String?
   resumeFileData      String?            @db.LongText

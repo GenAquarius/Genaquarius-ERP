@@ -6,6 +6,7 @@
 // fire. ReminderLog's per-(employee, type, day, slot) dedup row keeps this safe against the app
 // restarting or ticking more than once within the same slot.
 import { prisma } from "../prisma";
+import { checklistTypesForEmployee, pendingTypes } from "./onboardingChecklist";
 import { notifyMail, isFlowEnabled } from "./notify";
 import { itAdminEmails } from "./itAdmin";
 
@@ -43,14 +44,15 @@ function matchesSlot(times: string[], now: string): string | null {
 const ONBOARDING_REMINDER_WINDOW_DAYS = 60;
 
 async function sendOnboardingReminders(slot: string) {
-  const docTypes = await prisma.onboardingDocumentType.findMany({ where: { required: true } });
-  if (!docTypes.length) return;
   const windowStart = new Date(Date.now() - ONBOARDING_REMINDER_WINDOW_DAYS * 86400000);
   const employees = await prisma.employee.findMany({ where: { exitDate: null, email: { not: null }, joiningDate: { gte: windowStart } } });
   for (const emp of employees) {
-    const existing = await prisma.employeeOnboardingDocument.findMany({ where: { employeeId: emp.id } });
-    const byType = new Map(existing.map((d) => [d.docTypeId, d]));
-    const pending = docTypes.filter((t) => { const d = byType.get(t.id); return !d || d.status === "PENDING" || d.status === "REJECTED"; });
+    // The employee's own applicable checklist, one entry per document name — previously every
+    // BU's cloned copy was checked separately, so a file on one copy still read as "pending" on
+    // the other and names were listed twice in the email (see engine/onboardingChecklist).
+    const docTypes = (await checklistTypesForEmployee(emp.id)).filter((t) => t.required);
+    const existing = await prisma.employeeOnboardingDocument.findMany({ where: { employeeId: emp.id }, include: { docType: true } });
+    const pending = pendingTypes(docTypes, existing);
     if (!pending.length) continue;
     if (await alreadySentToday(emp.id, "ONBOARDING_DOCS", slot)) continue;
     try {

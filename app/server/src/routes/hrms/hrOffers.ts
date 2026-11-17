@@ -18,6 +18,7 @@ import { voidInFlightAgreements } from "../../engine/adobeSign";
 import { itAdminEmails } from "../../engine/itAdmin";
 import { fiscalOfDate } from "../../engine/workdays";
 import { createMonthlyLine } from "../finance/monthly";
+import { cleanUanPf } from "../../engine/uanPf";
 
 // Find (or seed) the MonthlySheet that a given calendar date falls in, creating the FiscalYear
 // row too if this is the first time that year is touched — mirrors fiscalYear.ts's own seeding,
@@ -653,6 +654,7 @@ router.post("/offers", async (req, res) => {
       residentPincode: b.residentSameAsPermanent === false ? (b.residentPincode || null) : null,
       gender: b.gender || null, maritalStatus: b.maritalStatus || null,
       dateOfBirth: b.dateOfBirth ? new Date(b.dateOfBirth) : null,
+      uanPfDetails: cleanUanPf(b.uanPfDetails) ?? null,
       // Role field removed from Generate Offer's form (Designation covers the same purpose) —
       // always mirror Designation here so every existing role-based renderer keeps working.
       role: b.designation, designation: b.designation,
@@ -740,6 +742,7 @@ router.put("/offers/:id", async (req, res) => {
       gender: b.gender !== undefined ? (b.gender || null) : undefined,
       maritalStatus: b.maritalStatus !== undefined ? (b.maritalStatus || null) : undefined,
       dateOfBirth: b.dateOfBirth !== undefined ? (b.dateOfBirth ? new Date(b.dateOfBirth) : null) : undefined,
+      uanPfDetails: cleanUanPf(b.uanPfDetails),
       role: b.designation !== undefined ? b.designation : b.role, designation: b.designation,
       businessUnitId: b.businessUnitId !== undefined ? (b.businessUnitId ? Number(b.businessUnitId) : null) : undefined,
       countryCode: b.countryCode,
@@ -852,6 +855,7 @@ router.post("/offers/:id/regenerate", async (req, res) => {
     gender: b.gender !== undefined ? (b.gender || null) : offer.gender,
     maritalStatus: b.maritalStatus !== undefined ? (b.maritalStatus || null) : offer.maritalStatus,
     dateOfBirth: b.dateOfBirth !== undefined ? (b.dateOfBirth ? new Date(b.dateOfBirth) : null) : offer.dateOfBirth,
+    uanPfDetails: b.uanPfDetails !== undefined ? (cleanUanPf(b.uanPfDetails) ?? null) : offer.uanPfDetails,
     countryCode: b.countryCode ?? offer.countryCode,
     offerDate: b.offerDate !== undefined ? (b.offerDate ? new Date(b.offerDate) : offer.offerDate) : offer.offerDate,
     role: b.designation ?? offer.role, designation: b.designation ?? offer.designation,
@@ -2304,6 +2308,7 @@ router.post("/offers/:id/confirm-joining", async (req, res) => {
       residentState: offer.residentSameAsPermanent ? offer.candidateState : offer.residentState,
       residentPincode: offer.residentSameAsPermanent ? offer.candidatePincode : offer.residentPincode,
       gender: offer.gender, maritalStatus: offer.maritalStatus, dateOfBirth: offer.dateOfBirth,
+      uanPfDetails: offer.uanPfDetails,
       emergencyContactPhone: (appt?.dynamicFields as any)?.EmergencyContactPhone || null },
   });
   await linkUserToEmployee(id, employee.id, employee.email);
