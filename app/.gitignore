@@ -1,0 +1,28 @@
+# dependencies / build
+node_modules/
+server/dist/
+server/client-dist/
+client/dist/
+
+# LOCAL env + secrets (never commit) — prod config lives in Azure App Service settings
+.env
+.env.local
+*.env.local
+server/.env
+server/.env.local
+client/.env.local
+
+# deploy artifacts
+deploy/app.zip
+
+# terraform state + secrets
+deploy/terraform/.terraform/
+deploy/terraform/*.tfstate
+deploy/terraform/*.tfstate.*
+deploy/terraform/terraform.tfvars
+deploy/terraform/*.tfvars.json
+deploy/terraform/.terraform.lock.hcl
+
+# misc
+*.log
+.DS_Store

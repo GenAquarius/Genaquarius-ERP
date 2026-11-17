@@ -1,0 +1,22 @@
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: costing_mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: costing_root
+      MYSQL_DATABASE: costing
+      MYSQL_USER: costing
+      MYSQL_PASSWORD: costing_pw
+    ports:
+      - "3307:3306"
+    volumes:
+      - costing_db:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-pcosting_root"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  costing_db:

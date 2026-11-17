@@ -1,0 +1,2682 @@
+// GenAquarius Costing & Billing Platform — data model
+// Fully dynamic: clients, projects, rates, categories, roles, templates are all data.
+generator client {
+  provider      = "prisma-client-js"
+  // include Linux engines so the app runs on Azure App Service (Debian)
+  binaryTargets = ["native", "debian-openssl-3.0.x", "debian-openssl-1.1.x"]
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// ----------------------------------------------------------------------------
+// Auth / RBAC
+// ----------------------------------------------------------------------------
+enum Role {
+  CEO
+  // Chief Operating Officer — senior-exec tier alongside CEO/CTO (ADMIN_ROLES), own row in the
+  // Module Access Matrix like every other role, defaults to the same full access CEO/CTO start
+  // with (CTO can narrow it from the matrix at any time — see permissions.ts's own comment on why
+  // CEO/COO are no longer hard-locked to allowed:true there).
+  COO
+  CTO
+  FINANCE
+  PROJECT_MANAGER
+  EMPLOYEE
+  // Auto-created (alongside a regular EMPLOYEE row for a full-time hire) the moment IT Admin
+  // approves a Contractor's O365 mailbox — see routes/itsm/itAdmin.ts's /tasks/:offerId/complete.
+  // Deliberately narrower than EMPLOYEE by default in the Module Access Matrix (RolePermission):
+  // Employee Dashboard, My Timesheet, My Profile and IT Helpdesk only — no Holiday Calendar/Leave
+  // & Attendance. CEO/CTO can still widen or narrow it further from the matrix at any time.
+  CONTRACTOR
+  // Onboarded via the simplified Intern flow (see engine/workflow.ts's INTERN employmentType) —
+  // unlike CONTRACTOR, gets the SAME full Module Access Matrix access as EMPLOYEE (Employee
+  // Dashboard, My Timesheet, My Profile, Holiday Calendar, Leave & Attendance, IT Helpdesk) —
+  // an explicit ask, not a narrower default.
+  INTERN
+  HR // HR operations + settings — explicitly no access to Finance/Executive dashboards
+  QA // QA/demo tester — full testing access, only ever exists in the isolated QA database
+  // Still fundamentally an employee (requireEmployee everywhere is employeeId-gated, not
+  // role-gated, so an IT_ADMIN keeps every ordinary ESS feature) — PLUS the IT Admin module
+  // (new-hire IT provisioning task queue) and is the live recipient list for every "notify IT"
+  // email in the app (see engine/itAdmin.ts), replacing the old free-text itAdminEmail setting.
+  IT_ADMIN
+}
+
+model User {
+  id           Int         @id @default(autoincrement())
+  name         String
+  email        String      @unique
+  passwordHash String
+  role         Role
+  isActive     Boolean     @default(true)
+  employeeId   Int?
+  employee     Employee?   @relation(fields: [employeeId], references: [id])
+  createdAt    DateTime    @default(now())
+  timesheets   Timesheet[]
+  auditLogs    AuditLog[]
+}
+
+// ----------------------------------------------------------------------------
+// Reference data (all editable from admin — nothing hardcoded)
+// ----------------------------------------------------------------------------
+model Geography {
+  id      Int      @id @default(autoincrement())
+  code    String   @unique // US, CANADA, CARIBBEAN, INDIA, OTHER
+  name    String
+  clients Client[]
+}
+
+enum BillingType {
+  FIXED
+  TNM
+}
+
+enum BillingScope {
+  PROJECT
+  RESOURCE
+}
+
+enum DeliveryModel {
+  ONSITE
+  OFFSHORE
+  HYBRID
+}
+
+enum Currency {
+  USD
+  INR
+  CAD
+}
+
+// ----------------------------------------------------------------------------
+// Clients & Projects
+// ----------------------------------------------------------------------------
+model Client {
+  id                Int              @id @default(autoincrement())
+  name              String           @unique
+  legalEntityName   String? // legal entity name (defaults to the client name)
+  code              String           @unique // used in invoice numbering e.g. KIRA
+  email             String? // TO — AP/billing email(s), comma-separated; invoice email recipients
+  ccEmail           String? // CC — AP/billing email(s), comma-separated; invoice email CC list
+  bccEmail          String? // BCC — AP/billing email(s), comma-separated; invoice email BCC list
+  geographyId       Int?
+  geography         Geography?       @relation(fields: [geographyId], references: [id])
+  state             String? // state / province, chosen from the geography's list on the Client form
+  addressTo         String? // who the invoice/email is addressed to (e.g. "AP Team")
+  billToAddress     String?          @db.Text
+  attentionContact  String?
+  logo              String?          @db.LongText // data-URL (base64) client logo, shown on invoices
+  currency          Currency         @default(USD)
+  paymentTermsDays  Int              @default(30)
+  invoiceTemplateId Int?
+  invoiceTemplate   InvoiceTemplate? @relation(fields: [invoiceTemplateId], references: [id])
+  projects          Project[]
+  invoices          Invoice[]
+  createdAt         DateTime         @default(now())
+}
+
+enum CtcApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+// A CTC record + Monthly Sheet line "proposed" by HR at Confirm Joining, held for Finance review
+// before either actually exists — so no new hire affects cost/revenue reporting until Finance
+// signs off. Mirrors CtcRecord's own INR/override component shape plus the Monthly Line intent
+// (project, deployment window, billable) Finance's approval screen turns into the real records.
+model CtcApprovalRequest {
+  id                 Int               @id @default(autoincrement())
+  employeeId         Int               @unique
+  employee           Employee          @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  offerId            Int?
+  status             CtcApprovalStatus @default(PENDING)
+  currency           String
+  empType            String
+  location           String
+  basic              Float             @default(0)
+  hra                Float             @default(0)
+  otherAllowance     Float             @default(0)
+  specialAllowance   Float             @default(0)
+  conveyance         Float             @default(0)
+  communication      Float             @default(0)
+  meals              Float             @default(0)
+  books              Float             @default(0)
+  driver             Float             @default(0)
+  uniform            Float             @default(0)
+  bonusAnnual        Float             @default(0)
+  annualCostOverride Float?
+  ctcEffectiveFrom   DateTime
+  ctcEffectiveTill   DateTime?
+  projectId          Int?
+  deploymentStart    DateTime?
+  deploymentEnd      DateTime?
+  isBillable         Boolean           @default(true)
+  billingMode        String            @default("HOURLY")
+  rateUsd            Float?
+  requestedById      Int?
+  requestedAt        DateTime          @default(now())
+  reviewedById       Int?
+  reviewedAt         DateTime?
+  reviewNote         String?           @db.Text
+
+  @@index([status])
+}
+
+enum AppraisalStatus {
+  DRAFT
+  GENERATED
+  PREVIEWED
+  ISSUED // letter sent to the employee — CTC change is now PENDING Finance/CTO/CEO approval
+  APPROVED
+  REJECTED
+}
+
+// HR-editable "Annual Performance Review" letter body — same simple bodyText/{{placeholder}}
+// shape as HrOfferTemplate (this letter is a handful of flowing paragraphs, not a clause library).
+model HrAppraisalTemplate {
+  id             Int             @id @default(autoincrement())
+  name           String
+  // Added alongside businessUnitId below — this template had no country scoping at all before;
+  // existing rows backfill to "INDIA" (the only country this template was ever built for so far).
+  countryCode    String          @default("INDIA")
+  businessUnitId Int?
+  businessUnit   HrBusinessUnit? @relation(fields: [businessUnitId], references: [id])
+  bodyText       String  @db.Text
+  isDefault      Boolean @default(false)
+
+  @@index([countryCode, businessUnitId])
+}
+
+// Relieving & Experience Certificate — issued once an employee's exit is finalized (FNF done,
+// Employee.exitDate set). Same simple bodyText/{{placeholder}} shape as the Appraisal/Offer
+// templates; no country scoping (the letter's wording doesn't vary by country the way CTC
+// structure does).
+model HrRelievingLetterTemplate {
+  id             Int             @id @default(autoincrement())
+  name           String
+  businessUnitId Int?
+  businessUnit   HrBusinessUnit? @relation(fields: [businessUnitId], references: [id])
+  subject        String          @default("Relieving & Experience Certificate")
+  bodyText       String          @db.Text
+  isDefault      Boolean         @default(false)
+  // Optional per-template signatory override, same convention as FnfSettlementTemplate — when set,
+  // this Relieving Letter signs off as THIS person/title instead of the shared HR Signature
+  // (HR Settings → Signature). Blank = falls back to the shared HR Signature exactly as before.
+  signatoryName  String?
+  signatoryTitle String?
+
+  @@index([businessUnitId])
+}
+
+// One Relieving & Experience Certificate instance for a terminated employee. Every field HR might
+// need to correct (subject, date, designation, emp id, every date) is editable right up until it's
+// actually emailed (status SENT) — see routes/hrms/relievingLetters.ts. Re-renderable to PDF any
+// time afterward (GET /:id/pdf), which is what "kept in Employee Master's document records" means
+// here — same convention as Appointment Letter/Appraisal, no separate stored PDF blob.
+model RelievingLetter {
+  id              Int       @id @default(autoincrement())
+  employeeId      Int
+  employee        Employee  @relation(fields: [employeeId], references: [id])
+  subject         String
+  date            DateTime
+  designation     String?
+  department      String?
+  empNo           String?
+  joiningDate     DateTime?
+  lastWorkingDate DateTime?
+  // Day the relief actually takes effect — typically lastWorkingDate + 1, but editable
+  // independently since HR sometimes states it differently.
+  relievedDate    DateTime?
+  resignationDate DateTime?
+  status          String    @default("GENERATED") // GENERATED | SENT
+  sentAt          DateTime?
+  sentTo          String?
+  createdById     Int?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([employeeId])
+}
+
+// A revised-CTC appraisal for an EXISTING active employee (not the hiring pipeline — no Offer
+// record). Generate → Preview → Issue mirrors the Offer Letter lifecycle; issuing is what emails
+// the employee AND puts the CTC change up for Finance/CTO/CEO approval (appraisalApprovals.ts),
+// which is what actually creates the new CtcRecord. India Full-Time gets the full salary-breakup
+// table (same bracket engine as Offers); Contractor gets a flat monthly figure; US/Canada get a
+// flat annual override — same three-way split Confirm Joining already uses.
+model Appraisal {
+  id                  Int             @id @default(autoincrement())
+  appraisalRef        String          // "GenAquarius/July/0033" — see nextAppraisalRef(). Not unique: two
+  // appraisals for the same employee in the same month share the same ref on purpose (no -2/-3 suffix).
+  employeeId          Int
+  employee            Employee        @relation(fields: [employeeId], references: [id])
+  designation         String
+  // HR's own explicit call, not auto-detected from any diff against the employee's current
+  // designation (too fragile — whitespace/casing differences, or HR re-entering the same title on
+  // purpose, would false-positive). When true, the letter adds its own promotion paragraph — see
+  // routes/hrms/appraisals.ts's buildPdfData.
+  isPromotion         Boolean         @default(false)
+  reviewPeriod        String?
+  effectiveDate       DateTime
+  countryCode         String // INDIA | US | CANADA | OTHER — snapshot of employee.location at creation
+  empType             String // snapshot of employee.empType at creation
+  bracketId           Int?
+  revisedCtc          Float? // India Full-Time only — annual, drives salaryBreakup
+  salaryBreakup       Json?
+  monthlyCompensation Float? // Contractor only
+  annualCostOverride  Float? // US / Canada only
+  // Optional SECOND step of a staged raise (e.g. "11.5L now, another 11.5L from Feb") — one
+  // combined letter communicates both, but Approve still creates two separate, correctly-dated
+  // CtcRecord segments (see appraisalApprovals.ts) so CTC history and Monthly Forecast stay
+  // accurate for each period. Null = a normal single-step appraisal (the common case).
+  secondEffectiveDate       DateTime?
+  secondRevisedCtc          Float?
+  secondSalaryBreakup       Json?
+  secondMonthlyCompensation Float?
+  secondAnnualCostOverride  Float?
+  // Key Result Areas for this role going forward — optional free text (e.g. "help in pre-sales
+  // activities such as client calls, preparing case studies and proposals, and take AI sessions
+  // for the internal team"), rendered as its own paragraph in the letter. Structured here (not
+  // just typed into customBodyOverride) so it survives a "Reset to default wording" and shows up
+  // on the New/Edit forms, not only inside the free-text letter editor.
+  kra                 String?         @db.Text
+  templateId          Int?
+  dynamicFields       Json?
+  // HR's hand-edited letter wording — when set, this is what Preview/Issue actually use instead of
+  // the auto-generated text from the template. Null = still fully auto-generated (the common
+  // case). Cleared ("Reset to default wording") by setting back to null, which reverts to live
+  // auto-generation from the current template + field values.
+  customBodyOverride  String?         @db.Text
+  status              AppraisalStatus @default(DRAFT)
+  issuedAt            DateTime?
+  requestedById       Int?
+  reviewedById        Int?
+  reviewedAt          DateTime?
+  reviewNote          String?         @db.Text
+  createdById         Int?
+  createdAt           DateTime        @default(now())
+  updatedAt           DateTime        @updatedAt
+
+  @@index([status])
+}
+
+// HR proposes only an exit date; Finance/CTO/CEO review the SAME rich Terminate form (day basis,
+// FNF, cost/invoice overrides — see masters.ts's terminateEmployee()) and approving is what
+// actually calls it. Nothing is applied to the Employee/MonthlyLine records until then.
+model TerminationApprovalRequest {
+  id            Int               @id @default(autoincrement())
+  employeeId    Int
+  employee      Employee          @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  exitDate      DateTime
+  // Date the employee formally submitted their resignation — distinct from exitDate (the last
+  // working day / effective termination date). Drives the auto-computed Notice Period Served
+  // (days between this and exitDate) on the HR request form; optional/informational otherwise.
+  resignationDate DateTime?
+  // Contractor/vendor path (Employee.empType !== "FULL_TIME"): last day billable to the client,
+  // distinct from exitDate (the administrative termination/removal date) — drives Finance's
+  // invoice/billing proration for the termination month. Null for full-time employees.
+  deploymentEndDate    DateTime?
+  // Contractor two-step approval: Finance approves the Deployment End Date first (adjusts Monthly
+  // Forecast immediately — truncates/removes future billable lines — no FnF, employee stays
+  // active), then approves the actual termination later once FnF is worked out. Null until step
+  // one runs; full-time requests (single-step) never set these.
+  deploymentEndApprovedById Int?
+  deploymentEndApprovedAt   DateTime?
+  // Full-time path — HR fills these (Basic auto-pulled from the employee's current CTC record,
+  // editable) and elEncashmentAmount/noticePayAmount are auto-computed from them + the live EL
+  // balance; HR can override any computed amount before notifying Finance, and Finance can
+  // override again at approval. Null/0 for contractors — their FnF is billing-based instead.
+  requiredNoticeDays   Int?
+  servedNoticeDays     Int?
+  // "Notice Served Waiver" — false (default): Notice Pay is FullPay/30 × servedNoticeDays (pay for
+  // the notice period actually served). true: the company waives the requirement that notice be
+  // served and pays the FULL required notice period instead (FullPay/30 × requiredNoticeDays),
+  // regardless of days served. Toggled per request; the resulting noticePayAmount is always still
+  // HR/Finance-editable by hand afterward either way.
+  payFullNoticePeriod  Boolean           @default(false)
+  // Despite the column name (kept as-is to avoid another migration), this is "Full Pay" — Basic +
+  // HRA + Special/Other Allowance, the FIXED CTC bracket components — NOT the CtcRecord.basic field
+  // alone. Basic and Full Pay are explicitly different figures per business rule: the day-rate used
+  // for Salary-for-Days-Worked and Notice Pay is Full Pay, while Conveyance/Communication/Meals/
+  // Books/Driver/Uniform are reimbursement components excluded from it entirely. See
+  // routes/shared/masters.ts's fullPayFor() for where this is computed.
+  basicSalary          Float?
+  // Plain Basic (from the CTC record) — what Notice Pay alone prices off; basicSalary above
+  // ("Full Pay") is a deliberately different figure that Days-Worked-Salary prices off instead.
+  // Was NEVER persisted here before — Finance's review screen always re-derived it fresh from the
+  // live CTC record on load, silently discarding whatever HR had actually typed/submitted. Now
+  // stored exactly like every other HR-submitted FnF figure on this row.
+  basicOnly            Float?
+  basicCurrency        Currency?
+  elEncashmentDays     Float?
+  elEncashmentAmount   Float?
+  noticePayAmount      Float?
+  reimbursementAmount  Float?            @default(0)
+  // Salary for the days already worked in the termination month, up to (and including) the
+  // Termination Date — e.g. terminating on the 4th of the month pays Basic/30 × 4 days. Basic-
+  // denominated like the other FnF add-ons above; auto-computed, HR/Finance-editable.
+  daysWorkedSalary     Float?            @default(0)
+  // Two new FnF Settlement line items (matching Finance's own FF_Settlement statement layout —
+  // an Earned/Deductions grid, not just a flat list): Other Flexi Benefits is Finance-entered
+  // (no clean auto-source, e.g. LTA/medical/special-allowance payout), TDS is auto-suggested as a
+  // rough estimate off the other earned components (see computeFnfSuggestion) but always
+  // Finance-editable before finalizing — actual tax liability is Finance's call, not computed law.
+  otherFlexiBenefitsAmount Float?        @default(0)
+  tdsAmount            Float?            @default(0)
+  // Target date by which Finance should have the FnF settlement finalized — mandatory at
+  // request time (enforced in the route/form, not the column, so existing rows stay valid).
+  fnfFinalizationDate  DateTime?
+  // Full-time only: when true, the employee is removed from Monthly Forecast at the Deployment
+  // End Date instead of sitting on Bench until termination — same no-bench behavior contractors
+  // already get. HR sets it on the request; Finance sees/can override it before approving the
+  // Deployment End Date (locked once that step runs, like the date itself).
+  noBenchMovement      Boolean           @default(false)
+  // Finance's own free-text remarks/edits on the FnF settlement statement — reviewed and
+  // (optionally) edited before the document is downloaded; rendered live onto the PDF, same
+  // "no stored binary, always regenerated from current data" pattern as the Offer/Appointment
+  // letters (see engine/hrPdf.ts renderFnfPdf + routes/terminationApprovals.ts's PDF route).
+  fnfNote              String?           @db.Text
+  // Contractor-only — overrides JUST what prints on the FnF document for "Last Day of Working":
+  // never feeds back into daysWorkedSalary/EL/notice-pay math, which stays driven by the already-
+  // computed/stored figures (and payableDaysOverride below) regardless. Null = fall back to
+  // Deployment End Date (contractor) or the Termination Date (full-time), same as before this
+  // field existed.
+  fnfPrintDate          DateTime?
+  // Contractor-only — the actual day count BOTH the Salary-for-Days-Worked DOLLAR amount (Total
+  // CTC ÷ 12 ÷ days-in-month × this count) AND the printed "No. of Days Worked N days (Mon'YY)"
+  // label are computed from, replacing the auto-derived "days from month-start (or joining) to
+  // Deployment End Date" count. Does NOT affect "Last Day of Working" (fnfPrintDate's own job) —
+  // e.g. Deployment End Date Sep 15 + this set to 9 prints "No. of Days Worked 9 days (Sep'26)" /
+  // "Last Day of Working Sep 15th, 2026" side by side. Null = auto-derive, same as before.
+  payableDaysOverride   Int?
+  // Contractor-only — purely informational: prints as a "Leaves" line on the FnF document when
+  // set, no amount attached (contractors have no EL-encashment rate to price it against). Null/0
+  // = omitted from the document entirely, same as today.
+  leavesCount           Int?
+  // Contractor-only — unpaid amount owed from a PRIOR month. In INR, same as every other
+  // contractor FnF money field. When set (>0), the FnF document splits what used to be one
+  // "Gross Payable Amount" line into "Gross Payable Amount (Arrear - Previous Month)" and
+  // "Gross Payable Amount (This Month)", and GST/TDS are computed on the COMBINED total instead
+  // of This Month alone. Null/0 = omitted, single-line behavior unchanged from before this existed.
+  arrearAmount          Float?
+  // Set by POST /:id/fnf-settlement/send every time the FnF Settlement .docx is actually emailed —
+  // drives the Completed FnF queue's Sent/Not Sent status chip. Null = never sent yet; a resend
+  // just overwrites both with the latest attempt's timestamp/recipient.
+  fnfSentAt            DateTime?
+  fnfSentTo            String?
+  // Snapshot of terminateEmployee()'s actual result at final approval — the FnF settlement PDF
+  // (routes/terminationApprovals.ts's buildFnfPdfData) reads these instead of recomputing, so the
+  // document always matches the exact numbers Finance approved, contractor and full-time alike.
+  finalFnfAmount       Float?
+  finalMonthCost       Float?
+  // Contractor-only: whether the FnF Settlement document adds GST on top of the Gross Payable
+  // Amount (some contractors aren't GST-registered, or a settlement may genuinely not attract it)
+  // — defaults to true (GST applies) matching prior behavior. gstAmount is Finance's own override
+  // of the computed 18% figure (null = auto-compute Gross Payable × 18%); ignored entirely when
+  // includeGst is false. Both no-ops for full-time.
+  includeGst           Boolean           @default(true)
+  gstAmount            Float?
+  // Whether the employee's Office 365 account has actually been disabled — HR sets it at request
+  // time (usually "No, not yet"); if still false, Finance gets one more chance to flip it to true
+  // at final approval. The moment it becomes true, a notification fires to Finance/HR/the
+  // configured IT admin contact (Integration row "SYSTEM_SETTINGS".authConfig.itAdminEmail) to
+  // actually go deactivate the account — offboarding IT security step, not just a formality.
+  emailTerminated      Boolean           @default(false)
+  emailTerminatedNotifiedAt DateTime?
+  status        CtcApprovalStatus @default(PENDING)
+  requestedById Int?
+  requestedAt   DateTime          @default(now())
+  reviewedById  Int?
+  reviewedAt    DateTime?
+  reviewNote    String?           @db.Text
+
+  @@index([status])
+}
+
+// IT Admin's offboarding queue — the reverse of ItProvisioningRequest (onboarding). Created the
+// moment a termination becomes "ready to offboard" (approve-deployment-end for a Contractor/
+// Intern, or whenever Full-Time skips Bench via noBenchMovement — a still-on-Bench Full-Time
+// employee is genuinely still working, so no offboarding row is created until their own eventual
+// no-bench-movement approval or final Approve & Terminate). The employee's local login (User row)
+// is deleted immediately when this row is created — see terminationApprovals.ts — everything else
+// here (disable O365, remove license, remove from Intune access group, notify Finance/HR) waits
+// for IT Admin's own manual review + click, same pattern as onboarding's Pending Tasks.
+model ItOffboardingRequest {
+  id                    Int       @id @default(autoincrement())
+  employeeId            Int       @unique
+  employee              Employee  @relation(fields: [employeeId], references: [id])
+  terminationApprovalRequestId Int?
+  createdAt             DateTime  @default(now())
+  createdById           Int?
+  completedAt           DateTime?
+  completedById         Int?
+  accountDisabled       Boolean   @default(false)
+  licenseRemoved        Boolean   @default(false)
+  removedFromGroup      Boolean   @default(false)
+  error                 String?   @db.Text
+  assetCollectionTask   ItAssetCollectionTask?
+}
+
+// Singleton (always id=1) — the signatory shown on every generated Offer/Appointment/Appraisal/
+// Service Agreement PDF, configurable instead of the hard-coded "Vivek Kaw / CHRO" text + static
+// image asset those renderers used before. Falls back to that same hard-coded default wherever
+// this row (or its image) doesn't exist yet, so it's zero-regression until HR actually sets one.
+model HrSignature {
+  id             Int             @id @default(autoincrement())
+  // null = the company-wide default signatory; a real id = that Business Unit's own signatory
+  // override. No longer a strict id:1 singleton — see engine/hr.ts's getHrSignature().
+  businessUnitId Int?            @unique
+  businessUnit   HrBusinessUnit? @relation(fields: [businessUnitId], references: [id])
+  signatoryName  String?
+  signatoryTitle String?
+  imageData      String?         @db.LongText // base64, same convention as EmployeeOnboardingDocument
+  updatedById    Int?
+  updatedAt      DateTime        @updatedAt
+}
+
+// Generic supporting-document store — MSA/SOW/any file attached to a Client or Project record
+// (not tied to either table by a FK so one model serves both, and future entities can reuse it).
+model Attachment {
+  id           Int      @id @default(autoincrement())
+  entityType   String // "CLIENT" | "PROJECT"
+  entityId     Int
+  fileName     String
+  fileData     String   @db.LongText // base64, same convention as EmployeeOnboardingDocument
+  note         String?
+  uploadedById Int?
+  uploadedAt   DateTime @default(now())
+
+  @@index([entityType, entityId])
+}
+
+model Project {
+  id                         Int                      @id @default(autoincrement())
+  clientId                   Int
+  client                     Client                   @relation(fields: [clientId], references: [id])
+  name                       String
+  code                       String? // Project Code — auto-filled onto invoices
+  title                      String? // Project Title — auto-filled onto invoices
+  invoiceCode                String? // code used in the invoice name (token {InvoiceCode})
+  invoiceNoFormat            String? // Invoice NAME template, e.g. {InvoiceCode}{Year}{Month}
+  invoiceNameIncludeResource Boolean                  @default(false) // append -{ResourceName} to the invoice name
+  annexureHideLeaveRate      Boolean                  @default(false) // legacy combined flag (Leave + Bill Rate)
+  annexureHideLeave          Boolean                  @default(false) // hide the Leave column in the invoice Annexure
+  annexureHideBillRate       Boolean                  @default(false) // hide the Bill Rate / Day Rate column in the invoice Annexure
+  annexureHideHours          Boolean                  @default(false) // hide the Hours column in the invoice Annexure
+  annexureHideRole           Boolean                  @default(false) // hide the Role column in the invoice Annexure
+  annexureHide               Boolean                  @default(false) // omit the Annexure table from the invoice PDF entirely
+  lineItemsHideHours         Boolean                  @default(false) // hide the Hours column in the invoice Line Items
+  lineItemsHideRate          Boolean                  @default(false) // hide the Rate column in the invoice Line Items
+  lineItemsDayBasis          Boolean                  @default(false) // Line Items show Day Rate + Days instead of Rate + Hours
+  annexureDayBasis           Boolean                  @default(false) // Annexure shows Day Rate + Days instead of Bill Rate + Hours
+  annexureSumTotal           Boolean                  @default(false) // Annexure hides per-resource amount; shows one combined total
+  lineItemsAddGst            Boolean                  @default(false) // add a GST row to line items
+  lineItemsPerResource       Boolean                  @default(false) // one Line Item per resource: "IT Services - <Role>" (instead of grouping by rate)
+  // Description / resource-column options for Line Items — every checkbox used on the invoice page
+  // is written back here on Preview/Generate, so next month's draft opens pre-selected.
+  lineItemsShowDesc          Boolean                  @default(false)
+  lineItemsMergeDesc         Boolean                  @default(false)
+  lineItemsDesc              String?                  @db.Text
+  lineItemsShowResource      Boolean                  @default(false)
+  lineItemsHideRole          Boolean                  @default(false)
+  lineItemsSumTotal          Boolean                  @default(false)
+  columnLabels               String?                  @db.Text // JSON header overrides for both tables: {li:{c1,desc,rate,qty,amt}, ax:{name,role,tlo,leave,rate,qty,amt}}
+  gstExclusive               Boolean                  @default(false) // GST mode: false = included in amounts (backed out); true = added ON TOP of the subtotal
+  lineItemsSumAll            Boolean                  @default(false) // ONE "IT Services" row: total hours, blended rate, total amount
+  gstPercent                 Float                    @default(5) // GST % applied to the line-items subtotal
+  poNumber                   String? // client PO number — auto-filled onto invoices
+  customerRefNo              String? // customer reference number — auto-filled onto invoices
+  paymentTerms               String? // free-text payment terms (e.g. "Net 30 Days") — auto-filled onto invoices, shown on the right
+  description                String?                  @db.Text // default service/project description for invoices
+  // Billing contacts (moved from Client → Project; auto-filled onto invoices, editable per invoice)
+  billingEmail               String? // TO — AP/billing email(s), comma-separated
+  ccEmail                    String? // CC — AP/billing email(s), comma-separated
+  bccEmail                   String? // BCC — AP/billing email(s), comma-separated
+  addressTo                  String? // who the invoice/email is addressed to (e.g. "AP Team")
+  attentionContact           String?
+  billToAddress              String?                  @db.Text
+  invoiceLayoutId            Int?
+  invoiceLayout              InvoiceLayout?           @relation(fields: [invoiceLayoutId], references: [id])
+  currency                   Currency                 @default(USD) // billing currency for this project's invoices (moved from Client)
+  paymentTermsDays           Int                      @default(30) // net payment days → invoice Due Date (moved from Client)
+  billingType                BillingType              @default(TNM)
+  billingScope               BillingScope             @default(RESOURCE)
+  deliveryModel              DeliveryModel            @default(OFFSHORE)
+  billingHoursPerDay         Int                      @default(8) // standard billable hours/day (8 or 9) — drives Billing Days ↔ Est Hours
+  status                     String                   @default("ACTIVE")
+  startDate                  DateTime?
+  endDate                    DateTime?
+  employees                  EmployeeProject[]
+  managers                   ProjectManager[]
+  billingRates               BillingRate[]
+  monthlyLines               MonthlyLine[]
+  timesheets                 Timesheet[]
+  costAllocations            EmployeeCostAllocation[]
+  emailTemplates             EmailTemplate[]
+  invoiceTemplates           InvoiceTemplate[]
+  invoices                   Invoice[]
+  createdAt                  DateTime                 @default(now())
+  // Null = no project-specific template — falls back to the one TimesheetTemplate.isDefault row
+  // (Rule 1/9). Resolved to the LATEST version's id at assignment time, and re-pointed automatically
+  // whenever that template family gets a new version (see createTimesheetTemplateVersion).
+  timesheetTemplateId        Int?
+  timesheetTemplate          TimesheetTemplate?       @relation(fields: [timesheetTemplateId], references: [id])
+  approvedHours              ApprovedHour[]
+  subProjects                SubProject[]
+
+  @@unique([clientId, name])
+}
+
+// A lightweight, named child of a Project holding exactly the fields that vary per resource/
+// cost-center within one project (PO Number, Project Code, Customer Ref No, Title/Description) —
+// everything genuinely project-level (currency, billing type, delivery model, layout toggles,
+// invoice template) stays on the parent Project, shared. Deliberately keyed by its OWN name, not
+// by employeeId — a Sub-Project can represent a single resource (e.g. "Shilpa") or a cost-center/
+// workstream that outlives any one person (e.g. Clarien's "Infra", Cost Center 630), matching how
+// these were actually used before being collapsed out of separate fake Projects. Its own
+// poNumber/code/description ARE the persisted "remembered" settings — invoice generation reads
+// them directly, no history lookup needed.
+model SubProject {
+  id            Int           @id @default(autoincrement())
+  projectId     Int
+  project       Project       @relation(fields: [projectId], references: [id])
+  name          String
+  code          String?
+  poNumber      String?
+  customerRefNo String?
+  title         String?
+  description   String?       @db.Text
+  attentionContact String?
+  status        String        @default("ACTIVE")
+  monthlyLines  MonthlyLine[]
+  invoices      Invoice[]
+  createdAt     DateTime      @default(now())
+
+  @@unique([projectId, name])
+}
+
+// ----------------------------------------------------------------------------
+// Employees + CTC
+// ----------------------------------------------------------------------------
+model Employee {
+  id              Int                          @id @default(autoincrement())
+  empNo           String?
+  name            String
+  email           String? // work email — recipient for timesheet reminders
+  joiningDate     DateTime?
+  exitDate        DateTime?
+  location        String? // INDIA, US, CANADA, OTHER
+  // Set automatically from the Offer at Confirm Joining for anyone hired through that flow;
+  // editable here too so an employee added directly in Employee Master (no Offer record) can
+  // still have them. designation/department are free strings (same convention Offer.designation/
+  // department already use) rather than FKs, matching the Designation/Department master lists'
+  // own dropdown-of-strings design.
+  designation       String?
+  department        String?
+  reportingManager  String?
+  // Set from the Offer at Confirm Joining (same convention as designation/department/
+  // reportingManager above); editable here too for an employee added directly in Employee Master.
+  noticePeriod      String?
+  probationPeriod   String?
+  // Mirrors Offer.workLocation (no equivalent existed on Employee until now) — editable on
+  // Employee Master's Add/Edit form alongside the other onboarding-captured fields.
+  workLocation      String? @default("Office")
+  // Address Line (house/street/area) plus its structured components — mirrors Offer's
+  // candidateAddress/candidateCity/etc. (Permanent Address), copied over at Confirm Joining.
+  address           String? @db.Text
+  city              String?
+  landmark          String?
+  state             String?
+  pincode           String?
+  // Resident (current) Address — mirrors Offer's residentAddress/etc., copied over at Confirm
+  // Joining too. Falls back to the Permanent Address fields above when never filled separately.
+  residentAddress   String? @db.Text
+  residentCity      String?
+  residentLandmark  String?
+  residentState     String?
+  residentPincode   String?
+  // Set from the Offer at Confirm Joining; drives which Business Unit's CTC Bracket/Tax/
+  // Templates/Leave Policy/Onboarding Checklist override (if any) applies to this employee for
+  // appraisals and any future recalculation — see HrBusinessUnit's fallback-rule doc comment.
+  businessUnitId    Int?
+  businessUnit      HrBusinessUnit? @relation(fields: [businessUnitId], references: [id])
+  // CTO/Finance/CEO-only visibility — when true, this employee is entirely excluded from every
+  // HR-role employee list/dashboard/lookup (GET /employees, HR Dashboard, Terminate Employee,
+  // Generate Offer's Reporting-To dropdown, etc.); ADMIN_ROLES (CEO/CTO/FINANCE/QA) still see
+  // them normally everywhere. Settable only by ADMIN_ROLES — see masters.ts.
+  confidential      Boolean @default(false)
+  // Self-service profile fields — self-editable (phone/emergency contact); dob/anniversary
+  // drive the Birthday/Marriage-Anniversary leave types (engine/leave.ts), HR-set.
+  // `phone` is the PERSONAL number — the one printed on Appointment Letter/SLA/Offer/FnF/
+  // Relieving Letter per explicit business rule. `officialPhone` (company-issued, e.g. desk/work
+  // mobile) is tracked separately and never substituted onto those documents.
+  phone                 String?
+  officialPhone         String?
+  // Personal email (home/webmail) — distinct from `email` above (the official/work address).
+  // Shown/editable on Employee Master's Add/Edit form alongside the other onboarding-captured
+  // fields, per explicit request — never substituted for the work email anywhere.
+  personalEmail         String?
+  gender                String?
+  maritalStatus         String?
+  dateOfBirth           DateTime?
+  marriageAnniversary   DateTime?
+  emergencyContactName  String?
+  emergencyContactPhone String?
+  // Self-upload pending action on the Employee Dashboard (see /ess/pending-actions) — also the
+  // photo IT uses once the O365 email-creation action is built.
+  photoFileName         String?
+  photoFileData         String?           @db.LongText
+  photoUploadedAt       DateTime?
+  // Free-form so options can vary by location (US: FULL_TIME / W2_NO_BENEFIT / VENDOR;
+  // India & Canada: FULL_TIME / CONTRACTOR). The EmpType enum is kept for seed defaults.
+  empType         String                       @default("FULL_TIME")
+  isBillable      Boolean                      @default(true)
+  // Explicit "No Cost to Company" (zero-cost Contractor/Intern, set from ServiceAgreement.noCostToCompany
+  // at Confirm Joining) — excluded from headcount and every cost aggregate (engine/calc.ts,
+  // engine/hr.ts, routes/finance/monthly.ts) since they have no CTC/CtcRecord at all.
+  noCostToCompany Boolean                      @default(false)
+  ctcRecords      CtcRecord[]
+  projects        EmployeeProject[]
+  managedProjects ProjectManager[]
+  billingRates    BillingRate[]
+  monthlyLines    MonthlyLine[]
+  timesheets      Timesheet[]
+  users           User[]
+  costAllocations EmployeeCostAllocation[]
+  offer           Offer? // HR — the accepted offer this employee was activated from (Confirm Joining)
+  offboardingRequest ItOffboardingRequest?
+  assetCollectionTasks ItAssetCollectionTask[]
+  leaveBalances   LeaveBalance[]
+  leaveRequests   LeaveRequest[]
+  attendance      AttendanceRecord[]
+  onboardingDocs  EmployeeOnboardingDocument[]
+  actions         EmployeeAction[]
+  compOffCredits  CompOffCredit[]
+  attendanceRegularizations AttendanceRegularizationRequest[]
+  permissionRequests        PermissionRequest[]
+  ctcApprovalRequest        CtcApprovalRequest?
+  profileSubmission         EmployeeProfileSubmission?
+  terminationRequests       TerminationApprovalRequest[]
+  appraisals                Appraisal[]
+  relievingLetters          RelievingLetter[]
+  approvedHours             ApprovedHour[]
+  createdAt       DateTime                     @default(now())
+
+  @@index([name])
+}
+
+model EmployeeProject {
+  id            Int       @id @default(autoincrement())
+  employeeId    Int
+  employee      Employee  @relation(fields: [employeeId], references: [id])
+  projectId     Int
+  project       Project   @relation(fields: [projectId], references: [id])
+  allocationPct Float     @default(100)
+  fromDate      DateTime?
+  toDate        DateTime?
+
+  @@unique([employeeId, projectId])
+}
+
+// Who manages a Project — deliberately separate from EmployeeProject/MonthlyLine (resourcing +
+// cost). Assigning someone here is a plain "who's the PM" fact; it never creates a MonthlyLine or
+// touches Monthly Forecast. Only Employees linked to a User with Role.PROJECT_MANAGER are eligible
+// (enforced both client- and server-side — see /projects/pm-candidates and the managers routes in
+// masters.ts) — a project can have multiple PMs.
+model ProjectManager {
+  id         Int      @id @default(autoincrement())
+  projectId  Int
+  project    Project  @relation(fields: [projectId], references: [id])
+  employeeId Int
+  employee   Employee @relation(fields: [employeeId], references: [id])
+  assignedAt DateTime @default(now())
+
+  @@unique([projectId, employeeId])
+}
+
+// Versioned salary structure (effective-dated). Computed fields derived in engine.
+model CtcRecord {
+  id                 Int       @id @default(autoincrement())
+  employeeId         Int
+  employee           Employee  @relation(fields: [employeeId], references: [id])
+  effectiveFrom      DateTime
+  // Optional end of this segment's validity (inclusive). Null = open-ended (until the next
+  // record's start). Cost is prorated only for days within [effectiveFrom, effectiveTill].
+  effectiveTill      DateTime?
+  currency           Currency  @default(INR)
+  basic              Float     @default(0)
+  hra                Float     @default(0)
+  otherAllowance     Float     @default(0)
+  specialAllowance   Float     @default(0)
+  conveyance         Float     @default(0)
+  communication      Float     @default(0)
+  meals              Float     @default(0)
+  books              Float     @default(0)
+  driver             Float     @default(0)
+  uniform            Float     @default(0)
+  bonusAnnual        Float     @default(0)
+  // exact annual cost imported from workbook (Employee cost!T) for parity; optional manual override.
+  // For US employees this holds the resolved annual USD cost (W2 salary, or vendor hourly×hours/day×days/yr).
+  annualCostOverride Float?
+  monthsWorked       String? // e.g. "11 months 15 days" (informational, from workbook)
+  // Effective-dated employment type for this comp segment (CONTRACTOR / FULL_TIME / W2_NO_BENEFIT /
+  // VENDOR). Lets cost be prorated per (empType, CTC) period within a month. Employee.empType
+  // mirrors the latest record's value.
+  empType            String?
+  // US engagement model (null for India/other): "W2" salaried (annual USD) or "VENDOR" hourly.
+  usEngagement       String? // "W2" | "VENDOR"
+  // For hourly engagements (VENDOR / W2_NO_BENEFIT) the user picks how billing is based:
+  // "HOURLY" (hourly rate × hours/day) or "DAILY" (day rate × working days). Null = legacy hourly.
+  rateBasis          String? // "HOURLY" | "DAILY"
+  hourlyRateUsd      Float? // HOURLY: hourly cost rate in USD (also derived from day rate for DAILY)
+  dayRateUsd         Float? // DAILY: day cost rate in USD
+  hoursPerDay        Int? // HOURLY: standard hours/day (default 8)
+  workingDaysPerYear Int? // days/year used to annualize the CTC (default 260)
+  createdAt          DateTime  @default(now())
+
+  @@index([employeeId, effectiveFrom])
+}
+
+// ----------------------------------------------------------------------------
+// FX & Billing rates (editable, dated, per-context — nothing hardcoded)
+// ----------------------------------------------------------------------------
+model FxRate {
+  id            Int      @id @default(autoincrement())
+  context       String   @default("DEFAULT") // USD_INR (company rate), CANADA_FACTOR, ...
+  baseCcy       String // e.g. USD
+  quoteCcy      String // e.g. INR
+  rate          Float // INR per USD, or factor
+  effectiveFrom DateTime @default(now())
+  note          String?
+
+  @@index([context, effectiveFrom])
+}
+
+model BillingRate {
+  id                  Int       @id @default(autoincrement())
+  projectId           Int
+  project             Project   @relation(fields: [projectId], references: [id])
+  employeeId          Int? // null = project-level default
+  employee            Employee? @relation(fields: [employeeId], references: [id])
+  rateUsd             Float
+  rateBasis           String    @default("HOURLY") // HOURLY | MONTHLY
+  standardHoursPerDay Int       @default(8) // 8 or 9
+  effectiveFrom       DateTime  @default(now())
+
+  @@index([projectId, employeeId, effectiveFrom])
+}
+
+// ----------------------------------------------------------------------------
+// Monthly Forecast & Actuals (the "respective-month" form — Finance owned)
+// ----------------------------------------------------------------------------
+enum SheetStatus {
+  DRAFT
+  SUBMITTED
+  LOCKED
+}
+
+model MonthlySheet {
+  id          Int           @id @default(autoincrement())
+  fiscalYear  String // e.g. FY26-27
+  month       String // Apr..Mar
+  monthIndex  Int // 1..12 (Apr=1)
+  status      SheetStatus   @default(DRAFT)
+  createdById Int?
+  lockedAt    DateTime?
+  lines       MonthlyLine[]
+  createdAt   DateTime      @default(now())
+
+  @@unique([fiscalYear, month])
+}
+
+model MonthlyLine {
+  id                 Int          @id @default(autoincrement())
+  monthlySheetId     Int
+  monthlySheet       MonthlySheet @relation(fields: [monthlySheetId], references: [id], onDelete: Cascade)
+  employeeId         Int?
+  employee           Employee?    @relation(fields: [employeeId], references: [id])
+  projectId          Int?
+  project            Project?     @relation(fields: [projectId], references: [id])
+  // Optional — which Sub-Project (resource/cost-center identity) within projectId this line
+  // belongs to. Null = no sub-grouping, same as before this field existed.
+  subProjectId       Int?
+  subProject         SubProject?  @relation(fields: [subProjectId], references: [id])
+  resourceName       String // as it appears on the sheet (kept verbatim for parity)
+  projectName        String?
+  rateUsd            Float        @default(0)
+  estimateHours      Float        @default(0)
+  actualHours        Float        @default(0)
+  fxMultiplier       Float        @default(1) // e.g. 0.71 Canada
+  // exact values imported from the workbook for zero-deviation parity:
+  billingAmount      Float        @default(0) // Rate*Estimate (sheet col G)
+  invoiceAmount      Float        @default(0) // Rate*Actual   (sheet col I)
+  costUsd            Float        @default(0) // cost side (Actual Cost!F) — always stored in USD
+  currency           String       @default("USD") // entry currency for expense lines (USD/INR/CAD)
+  nativeAmount       Float? // original amount in `currency` before USD conversion
+  adjustment         Float        @default(0) // captures manual fudge factors, admin-editable
+  isExpense          Boolean      @default(false) // overhead/vendor line vs billable resource
+  // Resource lines only: billable (rate × hours → revenue) vs non-billable (cost only, no revenue).
+  isBillable         Boolean      @default(true)
+  // How a billable resource is billed: HOURLY (rate/hr × hours), DAILY (day-rate × billing days),
+  // MONTHLY (fixed monthly revenue; rate derived). Stored normalized to rate/hr + hours regardless.
+  billingMode        String?      @default("HOURLY")
+  // Add-ons on TOP of the CTC/base cost: a bonus and a double-dip incentive. costUsd stores the
+  // total (base + bonus + incentive); these columns track the add-ons so they round-trip in editing.
+  doubleDipIncentive Float?       @default(0)
+  doubleDip          Boolean      @default(false) // explicitly flagged as a double-dip resource (checkbox)
+  allocationPct      Int          @default(100) // FTE allocation of this line: 100 or 50 (weights head count)
+  bonus              Float?       @default(0)
+  // Deployment start date (resource lines). In the start month the CTC cost is prorated by
+  // calendar days from this date to month-end (CTC ÷ days-in-month × days from start).
+  deploymentStart    DateTime?
+  // Deployment end date (inclusive). The end month is prorated to it (cost AND hours/revenue); for
+  // the rest of that month and every later month the person sits on the bench (cost only, no
+  // estimate / invoice) until their exit date. Clone / "apply to future months" follow this.
+  deploymentEnd      DateTime?
+  expenseType        String       @default("VARIABLE") // FIXED | VARIABLE (only meaningful for expense lines)
+  region             String? // INDIA | US | CANADA — geography of an expense/overhead line
+  // Expense allocation level: ORG = organization-wide overhead; PROJECT = allocated to a
+  // specific customer project (projectId set) so it factors into that project's margin.
+  expenseScope       String?      @default("ORG")
+  // Expense calculation: FIXED (flat), PER_BILLABLE (perResourceInr × offshore billable
+  // headcount → INR→USD), DYNAMIC (percentValue% of the month's total employee cost USD), or
+  // PCT_PREV_INVOICE (percentValue% of the PREVIOUS month's invoice total across
+  // commissionProjectIds — e.g. Oct's commission is percentValue% of Sep's invoices).
+  expenseCalc        String?      @default("FIXED")
+  perResourceInr     Float?
+  percentValue       Float? // DYNAMIC / PCT_PREV_INVOICE: percent (e.g. 2 = 2%)
+  // PER_BILLABLE only: a manual override of the offshore billable headcount. Null = auto
+  // (track the month's live count); set = use this fixed number for the commission instead.
+  headcountOverride  Int?
+  // PCT_PREV_INVOICE only: Project id[] whose previous month's invoice total is the commission
+  // basis — multiple projects sum together (e.g. a commission spread across a client's Onsite +
+  // Offshore projects).
+  commissionProjectIds Json?
+
+  @@index([monthlySheetId])
+}
+
+// ----------------------------------------------------------------------------
+// Timesheets (monthly total + tasks + leave; select project on login)
+// ----------------------------------------------------------------------------
+enum TimesheetStatus {
+  DRAFT // employee editing
+  SUBMITTED // sent to PM
+  PM_APPROVED // PM approved → awaiting Finance
+  FINANCE_APPROVED // Finance approved → reflected into the monthly Invoice column
+  REJECTED // bounced back by PM or Finance (see rejectedReason)
+}
+
+model Timesheet {
+  id                  Int              @id @default(autoincrement())
+  employeeId          Int
+  employee            Employee         @relation(fields: [employeeId], references: [id])
+  projectId           Int
+  project             Project          @relation(fields: [projectId], references: [id])
+  periodMonth         Int
+  periodYear          Int
+  totalHours          Float            @default(0)
+  // Sum of entries.hours where billable=true (non-leave) — the figure Finance's
+  // Approve & Reflect/preview actually use for Actual Hours/Invoice Amount, NOT totalHours
+  // (which includes non-billable work too). Persisted/denormalized the same way totalHours is,
+  // recomputed on every save — see routes/shared/timesheets.ts's own POST/proxy.
+  billableHours       Float            @default(0)
+  leaveDays           Float            @default(0)
+  status              TimesheetStatus  @default(DRAFT)
+  submittedAt         DateTime?
+  approvedById        Int? // PM approver
+  approvedBy          User?            @relation(fields: [approvedById], references: [id])
+  financeApprovedById Int? // Finance approver (plain id; resolved on read)
+  rejectedReason      String?          @db.Text
+  tasks               TimesheetTask[]
+  entries             TimesheetEntry[]
+  createdAt           DateTime         @default(now())
+  // Which template VERSION rendered this timesheet at submission time — set once, at creation,
+  // and never changed afterward even if the project's assigned template later gets a new version.
+  // Null = created before templates existed, or the project had none assigned (plain grid).
+  templateId          Int?
+  template            TimesheetTemplate? @relation(fields: [templateId], references: [id])
+
+  @@unique([employeeId, projectId, periodYear, periodMonth])
+}
+
+model TimesheetTask {
+  id          Int       @id @default(autoincrement())
+  timesheetId Int
+  timesheet   Timesheet @relation(fields: [timesheetId], references: [id], onDelete: Cascade)
+  description String    @db.Text
+  hours       Float     @default(0)
+}
+
+// Per-day entry on a monthly timesheet (calendar view): hours worked or a leave day + note.
+model TimesheetEntry {
+  id          Int       @id @default(autoincrement())
+  timesheetId Int
+  timesheet   Timesheet @relation(fields: [timesheetId], references: [id], onDelete: Cascade)
+  day         Int // day-of-month 1..31
+  hours       Float     @default(0)
+  leave       Boolean   @default(false)
+  comment     String?   @db.Text
+  head        String? // "Time Logged On" head — a day can have several (hours split per head)
+  // Whether THIS specific day+head entry is billable to the client — defaults true (the common
+  // case; most logged time bills). Set per entry (not per whole timesheet), so the same task can
+  // be billable on some days and not others. Drives: the export's Billable/Non-Billable
+  // breakdown, and Timesheet.billableHours (what Finance's Approve & Reflect actually uses for
+  // Actual Hours/Invoice Amount — never totalHours, which includes non-billable work too).
+  billable    Boolean   @default(true)
+  // Granular per-day/task rejection — PM/Finance can reject just THIS entry (with its own
+  // comment) instead of only the whole timesheet. The employee's calendar highlights any
+  // `rejected:true` day in red until they fix and resave it; saving clears the flag naturally
+  // (the entry is recreated fresh on every save — see routes/shared/timesheets.ts's own POST).
+  rejected          Boolean @default(false)
+  rejectionComment  String? @db.Text
+
+  @@unique([timesheetId, day, head])
+}
+
+// ----------------------------------------------------------------------------
+// Timesheet Templates — Finance-configurable layout/fields for the timesheet grid, separate from
+// the actual hour DATA above (Timesheet/TimesheetEntry), per the "data vs. presentation" principle
+// this whole feature is built around. `config` holds the full builder structure as JSON:
+// { sections: [{ id, title, order, fields: [{ id, label, type, order, width, required,
+//   defaultValue, formula, visibleIf, options? }] }], header: {...}, footer: {...}, logoUrl }
+// field.type is one of: TEXT, NUMBER, DATE, HOURS, BOOLEAN, SELECT, CALCULATED, APPROVAL.
+// Versioning: each version is its OWN row, sharing `name` with the others in its family; only one
+// row per name has isLatest=true (what NEW timesheets/assignments resolve to). A Timesheet's own
+// templateId is fixed at creation, so editing/versioning a template never rewrites history (Rule 6).
+model TimesheetTemplate {
+  id            Int        @id @default(autoincrement())
+  name          String
+  version       Int        @default(1)
+  isLatest      Boolean    @default(true)
+  // The one system-wide fallback used by any project with no specific assignment — enforced to be
+  // unique-among-true at the route level (Prisma can't express "at most one true" directly).
+  isDefault     Boolean    @default(false)
+  status        String     @default("ACTIVE") // ACTIVE | INACTIVE (deactivated, kept for history)
+  config        Json
+  createdById   Int?
+  createdAt     DateTime   @default(now())
+  updatedById   Int?
+  updatedAt     DateTime   @updatedAt
+  timesheets    Timesheet[]
+  projects      Project[]
+
+  @@index([name])
+}
+
+// One uploaded Finance "Import Timesheet" file — tracks what was uploaded and in which of the
+// supported formats, so each extracted row (ApprovedHour below) can be traced back to its source
+// file (Rule 19/traceability) and Finance can re-open/re-check the original.
+model ImportedTimesheetBatch {
+  id           Int            @id @default(autoincrement())
+  format       String // e.g. "STATION_CASINO_XLSX", "WENERGY_PDF", "BASTIAN_PDF" — see importTimesheet.ts
+  fileName     String
+  uploadedById Int
+  uploadedAt   DateTime       @default(now())
+  periodMonth  Int?
+  periodYear   Int?
+  rowCount     Int            @default(0)
+  hours        ApprovedHour[]
+}
+
+// One employee/project/period hour record, regardless of where it came from — System (the normal
+// Employee → PM → Finance submit/approve flow already above) or Imported (Finance's Import
+// Timesheet feature). Invoice generation reads APPROVED rows here as the hour source for a period
+// when Finance has chosen to use imported hours for that invoice cycle (Rule 7/8) — see
+// applyApprovedHoursToMonthlyLine in importTimesheet.ts, which pushes these onto the existing
+// MonthlyLine.actualHours/billingAmount fields rather than building a second, parallel billing path.
+model ApprovedHour {
+  id                   Int                      @id @default(autoincrement())
+  batchId              Int?
+  batch                ImportedTimesheetBatch?  @relation(fields: [batchId], references: [id], onDelete: SetNull)
+  employeeId           Int?
+  employeeNameRaw      String // as it literally appeared in the import — kept even once matched
+  employee             Employee?                @relation(fields: [employeeId], references: [id])
+  projectId            Int?
+  projectNameRaw        String?
+  project              Project?                 @relation(fields: [projectId], references: [id])
+  periodMonth          Int
+  periodYear           Int
+  regularHours         Float                    @default(0)
+  otHours              Float                    @default(0)
+  totalHours           Float                    @default(0)
+  source               String                   @default("IMPORTED") // "SYSTEM" | "IMPORTED"
+  status               String                   @default("PENDING") // PENDING | APPROVED
+  appliedToMonthlyLine Boolean                  @default(false)
+  createdAt            DateTime                 @default(now())
+}
+
+// ----------------------------------------------------------------------------
+// Expenses / Overheads (vendor, rent, insurance, tax, commissions, dep)
+// ----------------------------------------------------------------------------
+model Expense {
+  id         Int      @id @default(autoincrement())
+  scope      String // INDIA, US_CANADA, RESOURCING, INTERNAL
+  category   String
+  vendorName String?
+  amount     Float
+  currency   Currency @default(INR)
+  fiscalYear String?
+  month      String?
+  recurring  Boolean  @default(false)
+  note       String?  @db.Text
+  createdAt  DateTime @default(now())
+
+  @@index([fiscalYear, month])
+}
+
+// ----------------------------------------------------------------------------
+// Invoices
+// ----------------------------------------------------------------------------
+enum InvoiceStatus {
+  DRAFT
+  SENT
+  PAID
+  OVERDUE
+}
+
+model InvoiceTemplate {
+  id           Int       @id @default(autoincrement())
+  name         String    @unique
+  issuerBlock  Json
+  bankDetails  Json
+  layoutConfig Json?
+  clients      Client[]
+  invoices     Invoice[]
+  projects     Project[] // "Used By" — projects this template applies to (multi-select)
+  createdAt    DateTime  @default(now())
+}
+
+model Invoice {
+  id                    Int               @id @default(autoincrement())
+  clientId              Int
+  client                Client            @relation(fields: [clientId], references: [id])
+  invoiceNo             String            @unique
+  seq                   Int // strictly sequential per client
+  invoiceDate           DateTime
+  dueDate               DateTime
+  billingPeriodStart    DateTime?
+  billingPeriodEnd      DateTime?
+  poNumber              String?
+  customerRefNo         String?
+  paymentTerms          String? // snapshot from Project (editable per invoice); shown on the right header
+  // The actual Project chosen in the "Project" dropdown at Generate time — the durable link.
+  // projectCode/projectTitle below stay as the editable text SNAPSHOT shown on the invoice PDF
+  // (can be hand-edited per invoice, e.g. a custom title for one client), but this FK is what
+  // Reconciliation and anywhere else needing "which project is this invoice actually for" reads,
+  // since the text snapshot can be blank or edited away while the real link never is.
+  projectId             Int?
+  project               Project?          @relation(fields: [projectId], references: [id])
+  // Optional — which Sub-Project this invoice was generated for (per-resource/per-cost-center
+  // invoicing). Null = a combined invoice spanning the whole Project, same as before this existed.
+  subProjectId          Int?
+  subProject            SubProject?       @relation(fields: [subProjectId], references: [id])
+  projectCode           String?
+  projectTitle          String?
+  projectDescription    String?
+  annexureHideLeaveRate Boolean           @default(false)
+  annexureHideLeave     Boolean           @default(false)
+  annexureHideBillRate  Boolean           @default(false)
+  annexureHideHours     Boolean           @default(false)
+  annexureHideRole      Boolean           @default(false)
+  annexureHide          Boolean           @default(false)
+  lineItemsHideHours    Boolean           @default(false)
+  lineItemsHideRate     Boolean           @default(false)
+  lineItemsDayBasis     Boolean           @default(false)
+  // Optional "Description" column on the Line Items table: per-row text, or ONE merged cell
+  // (lineItemsDesc) spanning every row. Settings carry forward from the client's last invoice.
+  lineItemsShowDesc     Boolean           @default(false)
+  lineItemsMergeDesc    Boolean           @default(false)
+  lineItemsDesc         String?           @db.Text
+  // Annexure-style options for the Line Items table: show each resource's name instead of the
+  // Service text, hide the Role part, and merge the Amount column into ONE centred total cell.
+  lineItemsShowResource Boolean           @default(false)
+  lineItemsHideRole     Boolean           @default(false)
+  lineItemsSumTotal     Boolean           @default(false)
+  columnLabels          String?           @db.Text // JSON header overrides for both tables: {li:{c1,desc,rate,qty,amt}, ax:{name,role,tlo,leave,rate,qty,amt}}
+  gstExclusive          Boolean           @default(false) // GST mode: false = included in amounts (backed out); true = added ON TOP of the subtotal
+  annexureDayBasis      Boolean           @default(false)
+  annexureSumTotal      Boolean           @default(false)
+  lineItemsAddGst       Boolean           @default(false)
+  gstPercent            Float             @default(5)
+  layoutConfig          String?           @db.Text // snapshot of the InvoiceLayout config used at generation
+  // Billing-contact snapshot at generation (sourced from the Project; editable per invoice).
+  billingEmail          String?
+  ccEmail               String?
+  bccEmail              String?
+  addressTo             String?
+  attentionContact      String?
+  billToAddress         String?           @db.Text
+  currency              Currency          @default(USD)
+  totalAmount           Float             @default(0)
+  month                 String? // billing month snapshot (for grouping/bulk email)
+  fiscalYear            String? // billing fiscal year snapshot
+  status                InvoiceStatus     @default(DRAFT)
+  templateId            Int?
+  template              InvoiceTemplate?  @relation(fields: [templateId], references: [id])
+  lineItems             InvoiceLineItem[]
+  annexure              InvoiceAnnexure[]
+  attachments           InvoiceAttachment[]
+  createdAt             DateTime          @default(now())
+
+  @@index([clientId, seq])
+  @@index([projectId])
+}
+
+// Extra documents (timesheet, backup sheets, etc.) Finance attaches alongside the invoice PDF when
+// actually sending the email from the app — stored here so they survive past that one send and can
+// be reviewed/downloaded later from Invoice Generated, not just attached to the one outgoing email.
+// A bulk send (one email covering several invoices for a client+month) creates one row per
+// (invoice, file) pair, so every invoice in that batch shows the same shared attachment(s) on its
+// own row — never a shared/joined record that could be edited from one invoice and silently affect
+// another.
+model InvoiceAttachment {
+  id           Int      @id @default(autoincrement())
+  invoiceId    Int
+  invoice      Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  fileName     String
+  contentType  String?
+  fileData     String   @db.LongText // base64
+  uploadedAt   DateTime @default(now())
+  uploadedById Int?
+
+  @@index([invoiceId])
+}
+
+model InvoiceLineItem {
+  id           Int     @id @default(autoincrement())
+  invoiceId    Int
+  invoice      Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  description  String
+  detail       String? // "Description" column text for this row (when the invoice enables the column)
+  resourceName String? // the resource behind a per-resource line — shown when "Resource column" is on
+  rateUsd      Float
+  hours        Float
+  dayRate      Float? // Day-basis line items: rate per day
+  days         Float? // Day-basis line items: number of days
+  amount       Float
+}
+
+model InvoiceAnnexure {
+  id           Int     @id @default(autoincrement())
+  invoiceId    Int
+  invoice      Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  resourceName String
+  leave        String?
+  billRate     Float
+  hours        Float
+  dayRate      Float? // Day-basis annexure: rate per day
+  days         Float? // Day-basis annexure: number of days
+  timeLoggedOn String? // grouping label; consecutive equal values merge into one cell on the PDF
+  role         String? // resource role (e.g. Sr. Developer) — feeds per-resource Line Items "IT Services - <Role>"
+  amount       Float
+  // Permanent link back to the Monthly Forecast & Actuals line this row was invoiced from — set at
+  // generation time (buildInvoiceDraft always produces one per resource, see invoices.ts), null for
+  // any row predating this column or a manually-added annexure row with no backing forecast line.
+  // Lets Invoice Reconciliation match forecast<->invoice exactly instead of by Client+Month+Name.
+  lineId       Int?
+
+  @@index([lineId])
+}
+
+// ----------------------------------------------------------------------------
+// External integrations (Tally + Bank of America) and reconciliation ledger
+// ----------------------------------------------------------------------------
+model Integration {
+  id         Int       @id @default(autoincrement())
+  provider   String    @unique // TALLY | BOA
+  authConfig Json?
+  lastSyncAt DateTime?
+  status     String    @default("DISCONNECTED")
+}
+
+model ExternalLedger {
+  id               Int      @id @default(autoincrement())
+  provider         String // TALLY | BOA
+  extId            String
+  type             String // AR | PAYMENT | BALANCE | TXN
+  customerRef      String?
+  amount           Float
+  currency         String
+  asOfDate         DateTime
+  matchedInvoiceId Int?
+  raw              Json?
+
+  @@index([provider, type, asOfDate])
+}
+
+// Headline metrics from the Actual Cost summary block (rows 1-7) per month —
+// stored verbatim from the workbook so the Finance dashboard matches Excel.
+model ActualCostSummary {
+  id                Int    @id @default(autoincrement())
+  fiscalYear        String
+  month             String
+  monthIndex        Int
+  salaryExpense     Float?
+  totalCost         Float?
+  revenue           Float?
+  monthlyProfit     Float?
+  netProfitPct      Float?
+  headCount         Int?
+  billableHeadCount Int?
+  offshoreBillable  Int?
+  onsiteBillable    Int?
+
+  @@unique([fiscalYear, month])
+}
+
+// Editable list of expense/overhead categories (managed from the Add Expense dialog)
+model ExpenseCategory {
+  id   Int    @id @default(autoincrement())
+  name String @unique
+}
+
+// Public holidays / annual leave calendar per country (US / Canada / India).
+model Holiday {
+  id             Int             @id @default(autoincrement())
+  country        String // US | CANADA | INDIA
+  // null = the Country-level default calendar; set = a Business Unit's own override calendar
+  // for that same country — an employee's own businessUnitId picks up their BU's calendar if
+  // one exists, else falls back to the Country default (see engine/workdays.ts).
+  businessUnitId Int?
+  businessUnit   HrBusinessUnit? @relation(fields: [businessUnitId], references: [id])
+  date           DateTime
+  name           String
+  createdAt      DateTime        @default(now())
+
+  @@index([country, businessUnitId, date])
+}
+
+model AuditLog {
+  id       Int      @id @default(autoincrement())
+  userId   Int?
+  user     User?    @relation(fields: [userId], references: [id])
+  action   String
+  entity   String
+  entityId String?
+  before   Json?
+  after    Json?
+  at       DateTime @default(now())
+
+  @@index([entity, at])
+}
+
+// ----------------------------------------------------------------------------
+// F4 — Per-month, per-project cost allocation for an employee.
+// An employee's monthly CTC cost is split across projects by `pct` (sums to 100
+// per employee+fiscalYear+month). Engine expands these into MonthlyLine cost.
+// ----------------------------------------------------------------------------
+model EmployeeCostAllocation {
+  id         Int      @id @default(autoincrement())
+  employeeId Int
+  employee   Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  projectId  Int
+  project    Project  @relation(fields: [projectId], references: [id])
+  fiscalYear String // e.g. FY26-27
+  month      String // Apr..Mar
+  pct        Float    @default(0) // percent of the employee's monthly cost on this project
+  createdAt  DateTime @default(now())
+
+  @@unique([employeeId, fiscalYear, month, projectId])
+  @@index([fiscalYear, month])
+}
+
+// ----------------------------------------------------------------------------
+// F5 — Fiscal year definition + lifecycle (define / close-lock / rollover).
+// ----------------------------------------------------------------------------
+model FiscalYear {
+  id         Int       @id @default(autoincrement())
+  label      String    @unique // e.g. FY26-27
+  startMonth Int       @default(4) // 4 = April (FY runs startMonth..startMonth-1 next year)
+  status     String    @default("OPEN") // OPEN | LOCKED
+  closedAt   DateTime?
+  createdAt  DateTime  @default(now())
+}
+
+// ----------------------------------------------------------------------------
+// F7 — Per-geography email body + signature used when sending invoices.
+// Optional "Used By" project scoping. GenAquarius logo shown below signature.
+// ----------------------------------------------------------------------------
+// Configurable invoice PDF layout — field visibility/positions + section order, as JSON in `config`.
+model InvoiceLayout {
+  id        Int       @id @default(autoincrement())
+  name      String
+  isDefault Boolean   @default(false)
+  config    String    @db.Text
+  projects  Project[]
+  createdAt DateTime  @default(now())
+}
+
+model EmailTemplate {
+  id         Int       @id @default(autoincrement())
+  name       String
+  geography  String // US | CANADA | INDIA
+  entityName String? // e.g. GenAquarius LLC / Aquarius Technologies Limited
+  subject    String? // email subject line; supports {Month}, {Project Name}, {Invoice No}, {Client}
+  body       String    @db.Text
+  signature  String?   @db.Text
+  showLogo   Boolean   @default(true) // render GenAquarius logo below the signature
+  projects   Project[] // "Used By" — projects this template applies to (multi-select)
+  isDefault  Boolean   @default(false)
+  createdAt  DateTime  @default(now())
+
+  @@index([geography])
+}
+
+// ----------------------------------------------------------------------------
+// HR — Offer generation, CTC-based salary/tax calculation, appointment letters.
+// Everything an HR admin can tune (brackets, components, tax slabs, templates,
+// email copy) is a row here, never hard-coded in the engine (server/src/engine/hr.ts).
+// ----------------------------------------------------------------------------
+// Document-lifecycle status for the Offer/Appointment PAPERWORK itself (generate/preview/send/
+// accept) — NOT the employee-lifecycle STAGE sequence, which is now engine-driven (see
+// WorkflowDefinition/WorkflowStage/OfferStageProgress below, engine/workflow.ts). The relative
+// ORDER of "employee activation" vs "appointment generation" vs "document collection" vs
+// "IT provisioning" is configured by HR (Workflow & Stage Configuration), not fixed here — this
+// enum only tracks the mechanical DRAFT->GENERATED->PREVIEWED->SENT->ACCEPTED progression for each
+// document (Offer once, Appointment again reusing the APPOINTMENT_* values), plus the one
+// coarse milestone every other module already keys off: JOINING_CONFIRMED = Employee row exists.
+enum OfferStatus {
+  DRAFT
+  GENERATED
+  PREVIEWED
+  SENT
+  ACCEPTED
+  DECLINED
+  EXPIRED
+  WITHDRAWN
+  CANCELLED
+  APPOINTMENT_GENERATED // Employee ID reserved here — still hidden from every other module
+  APPOINTMENT_PREVIEWED
+  APPOINTMENT_ISSUED
+  JOINING_CONFIRMED // Employee row created/activated — visible everywhere from here on
+}
+
+// One CTC bracket (≤19L, 20-36L, 36-50L, 50L+ …) — HR can add/edit ranges freely.
+model HrCtcBracket {
+  id             Int                 @id @default(autoincrement())
+  name           String // "Bracket A"
+  countryCode    String              @default("INDIA")
+  // null = this is the Country-level default; set = a Business Unit's own override for that
+  // same country (see HrBusinessUnit's doc comment for the fallback rule).
+  businessUnitId Int?
+  businessUnit   HrBusinessUnit?     @relation(fields: [businessUnitId], references: [id])
+  minCtc         Float
+  maxCtc         Float? // null = open-ended (top bracket)
+  referenceSheet String? // provenance note, e.g. the source workbook this bracket was imported from
+  order          Int                 @default(0)
+  components     HrSalaryComponent[]
+
+  @@index([countryCode, businessUnitId, order])
+}
+
+// One salary line item for a bracket — Part A (Fixed) or Part B (Flexi Benefits).
+// `pct` is this component's share of its Part's total; HR edits these, never code.
+model HrSalaryComponent {
+  id        Int          @id @default(autoincrement())
+  bracketId Int
+  bracket   HrCtcBracket @relation(fields: [bracketId], references: [id], onDelete: Cascade)
+  name      String // "Basic Pay", "Conveyance / Fuel Allowance", ...
+  part      String // "A" (Fixed) | "B" (Flexi)
+  pct       Float        @default(0) // % of Part A or Part B total for this bracket
+  order     Int          @default(0)
+
+  @@index([bracketId, part, order])
+}
+
+model HrTaxBracket {
+  id             Int             @id @default(autoincrement())
+  countryCode    String          @default("INDIA")
+  businessUnitId Int?
+  businessUnit   HrBusinessUnit? @relation(fields: [businessUnitId], references: [id])
+  regime         String          @default("NEW") // NEW | OLD
+  minIncome      Float
+  maxIncome      Float? // null = open-ended (top slab)
+  ratePct        Float
+  order          Int             @default(0)
+
+  @@index([countryCode, businessUnitId, regime, order])
+}
+
+model HrCountryConfig {
+  id       Int    @id @default(autoincrement())
+  code     String @unique // INDIA | US | CANADA
+  name     String
+  currency String
+}
+
+// Standard deduction / cess are properties of a TAX REGIME (Old vs New), not the country as a
+// whole — the two regimes use different deduction amounts. One row per (country, regime).
+model HrTaxRegimeConfig {
+  id                Int    @id @default(autoincrement())
+  countryCode       String @default("INDIA")
+  regime            String // NEW | OLD
+  standardDeduction Float  @default(0) // annual, in local currency
+  cessPct           Float  @default(0)
+
+  @@unique([countryCode, regime])
+}
+
+model HrBusinessUnit {
+  id          Int     @id @default(autoincrement())
+  name        String  @unique // "GenAquarius Technologies Pvt Ltd"
+  countryCode String  @default("INDIA")
+  offers      Offer[]
+  employees   Employee[]
+  // Every one of these 8 config categories can be overridden per-Business-Unit; when a BU has
+  // no override row, engine/hr.ts's resolveByBusinessUnit() falls back to that BU's Country's
+  // own default (businessUnitId: null) — see the fallback helper and its callers for the pattern.
+  ctcBrackets              HrCtcBracket[]
+  taxBrackets              HrTaxBracket[]
+  offerTemplates           HrOfferTemplate[]
+  appointmentTemplates     HrAppointmentTemplate[]
+  serviceAgreementTemplates HrServiceAgreementTemplate[]
+  appraisalTemplates       HrAppraisalTemplate[]
+  relievingLetterTemplates HrRelievingLetterTemplate[]
+  leavePolicyConfigs       HrLeavePolicyConfig[]
+  leaveTypes               HrLeaveType[]
+  onboardingDocumentTypes  OnboardingDocumentType[]
+  signature                HrSignature?
+  emailTemplates           HrEmailTemplate[]
+  holidays                 Holiday[]
+  // US/Canada-only template catalog (see Offer's "US/Canada simplified onboarding" fields above).
+  msaTemplates             MsaTemplate[]
+  sowTemplates             SowTemplate[]
+  employeeProfileFields    EmployeeProfileFieldConfig[]
+}
+
+// Organization master lists (HR Admin Settings → Organization) — feed the Designation/Department
+// dropdowns on Generate Offer instead of free text.
+model HrDesignation {
+  id    Int    @id @default(autoincrement())
+  name  String @unique
+  order Int    @default(0)
+}
+model HrDepartment {
+  id    Int    @id @default(autoincrement())
+  name  String @unique
+  order Int    @default(0)
+}
+
+// Finance-owned FnF (Full & Final) settlement statement template — the .docx counterpart of the
+// fixed FnfPdf (engine/hrPdf.ts renderFnfPdf): a plain-text, {{placeholder}}-filled body Finance
+// edits from Finance Settings ("FnF Settlement" tab), same Advanced-Builder-with-live-preview
+// pattern as HrOfferTemplate/HrAppointmentTemplate above. One (or a few) rows, isDefault picks
+// which one /termination-approvals/:id/fnf-settlement.docx renders — see engine/fnfDocx.ts.
+model FnfSettlementTemplate {
+  id        Int      @id @default(autoincrement())
+  name      String
+  bodyText  String   @db.Text
+  // Every template is scoped to one employment type — a full-time employee's FnF (Basic/Notice
+  // Pay/EL Encashment) and a contractor's (Gross Payable/GST/TDS) are different enough documents
+  // that one shared template never made sense; "Set as Default" only unseats the other default
+  // WITHIN this same empType, so each type keeps its own default independently.
+  empType   String   @default("FULL_TIME") // "FULL_TIME" | "CONTRACTOR"
+  isDefault Boolean  @default(false)
+  // Optional per-template signatory override — when set, this FnF Settlement document signs off
+  // as THIS person/title instead of the shared HR Signature (HR Settings → Signature) that Offer/
+  // Appointment/Appraisal letters all use. Lets Finance sign FnF documents as e.g. the Finance Head
+  // instead of HR's CHRO. Blank = falls back to the shared HR Signature exactly as before.
+  signatoryName  String?
+  signatoryTitle String?
+  updatedAt DateTime @updatedAt
+}
+
+model HrOfferTemplate {
+  id             Int             @id @default(autoincrement())
+  name           String
+  countryCode    String          @default("INDIA")
+  businessUnitId Int?
+  businessUnit   HrBusinessUnit? @relation(fields: [businessUnitId], references: [id])
+  minCtc         Float           @default(0)
+  maxCtc         Float?
+  // Offer-letter body: plain text, blank-line-separated paragraphs, {{placeholders}} filled at
+  // generation (rendered as PDF paragraphs by engine/hrPdf.ts, not parsed as markup).
+  bodyText       String          @db.Text
+  isDefault      Boolean         @default(false)
+
+  @@index([countryCode, businessUnitId])
+}
+
+// Ordered clause library for an appointment letter template — `clauses` is a JSON
+// array of {key, title, body, enabled, order}; HR reorders/edits without a deploy.
+model HrAppointmentTemplate {
+  id             Int             @id @default(autoincrement())
+  name           String
+  countryCode    String          @default("INDIA")
+  businessUnitId Int?
+  businessUnit   HrBusinessUnit? @relation(fields: [businessUnitId], references: [id])
+  clauses        Json
+  isDefault      Boolean         @default(false)
+
+  @@index([countryCode, businessUnitId])
+}
+
+model HrEmailTemplate {
+  id             Int             @id @default(autoincrement())
+  key            String // OFFER_EMAIL | APPOINTMENT_EMAIL | SERVICE_AGREEMENT_EMAIL | SERVICE_AGREEMENT_WITHDRAWN_EMAIL | ...
+  businessUnitId Int?
+  businessUnit   HrBusinessUnit? @relation(fields: [businessUnitId], references: [id])
+  subject        String
+  body           String          @db.Text
+  signature      String?         @db.Text // sign-off block, kept separate from body — same shape as Finance's invoice EmailTemplate
+  showLogo       Boolean         @default(true) // GenAquarius logo rendered below the signature, same as Finance's toggle
+
+  @@unique([key, businessUnitId])
+}
+
+// EMPLOYEE keeps the existing Offer → Appointment Letter lifecycle unchanged (default, so every
+// pre-existing Offer row — which has no employmentType column today — resolves to EMPLOYEE via
+// this @default and behaves exactly as before). CONTRACTOR instead gets a single Service
+// Agreement document (see ServiceAgreement below) with no Offer/Appointment Letter step at all.
+enum EmploymentType {
+  EMPLOYEE
+  CONTRACTOR
+  // Reuses CONTRACTOR's Service-Agreement-only onboarding path (see hrOffers.ts's
+  // usesServiceAgreement()) — a much simpler flow than full EMPLOYEE onboarding, per explicit
+  // user choice, rather than a third parallel document/stage system.
+  INTERN
+}
+
+// Ordered clause library for a Service Agreement template — mirrors HrAppointmentTemplate's
+// `clauses` JSON shape (see engine/hrPdf.ts's ServiceAgreementClause type). `services` is the
+// separately-editable numbered list under Article 1(a) ("Technical Analysis", "Data Analysis", …)
+// since it varies per engagement, not part of the legal clause text itself.
+model HrServiceAgreementTemplate {
+  id             Int             @id @default(autoincrement())
+  name           String
+  countryCode    String          @default("INDIA")
+  businessUnitId Int?
+  businessUnit   HrBusinessUnit? @relation(fields: [businessUnitId], references: [id])
+  clauses        Json
+  services       Json // string[] — default ["Technical Analysis","Data Analysis","QA","Professional Services"]
+  isDefault      Boolean         @default(false)
+
+  @@index([countryCode, businessUnitId])
+}
+
+model Offer {
+  id                  Int                @id @default(autoincrement())
+  offerRef            String             @unique // OFR-2026-0142 — the only reference on the offer letter
+  // Always server-computed as `[First, Middle, Last].filter(Boolean).join(" ")` on create/update —
+  // never accepted directly from client input. Kept (rather than removed) because 60+ call sites
+  // (PDFs, emails, lists, audit) already key off it; candidateFirstName/candidateLastName below are
+  // the only fields HR actually types into on Stage 1.
+  candidateName       String
+  candidateFirstName  String             @default("")
+  candidateMiddleName String?
+  candidateLastName   String             @default("")
+  candidateEmail      String
+  candidatePhone      String? // personal number — carried onto Employee.phone at activation
+  candidateOfficialPhone String? // optional company-issued number, if assigned before activation
+  candidatePersonalEmail String? // personal email captured at onboarding — carried onto Employee.personalEmail at activation; candidateEmail above is the official/work email
+  candidateAddress    String?            @db.Text // Permanent Address
+  candidateCity       String?
+  candidateLandmark   String?
+  candidateState      String?
+  candidatePincode    String?
+  // Resident (current) Address — defaults to same as Permanent Address above; only filled in
+  // separately when it genuinely differs. IT Provisioning uses this (falling back to Permanent)
+  // as the ship-to address for laptop/equipment.
+  residentSameAsPermanent Boolean        @default(true)
+  residentAddress     String?            @db.Text
+  residentCity        String?
+  residentLandmark    String?
+  residentState       String?
+  residentPincode     String?
+  // Captured at Offer Generation, carried to Employee at Confirm Joining. Marriage Anniversary is
+  // deliberately NOT captured here — HR doesn't necessarily know it at hiring time — it's instead
+  // a self-fill pending action on the employee's own Dashboard once they're active and married.
+  gender              String?
+  maritalStatus       String?
+  dateOfBirth         DateTime?
+  // Both mandatory before HR can generate the OFFER itself — see the guard in /offers/:id/generate.
+  resumeFileName      String?
+  resumeFileData      String?            @db.LongText
+  resumeUploadedAt    DateTime?
+  // Aadhaar is captured/updated once here, before offer generation, and never asked for again
+  // later (Mandatory Document Collection explicitly excludes it — see DocumentCollectionRequest).
+  // Both the number AND the scanned image are captured together (2026-09-23, HR request).
+  aadhaarNumber       String?
+  aadhaarFileName     String?
+  aadhaarFileData     String?            @db.LongText
+  aadhaarUpdatedAt    DateTime?
+  // Intern's simplified Stage 1 (Candidate Information) captures ALL documents up front —
+  // Education Certificate and Photo, alongside Resume/Aadhaar above — instead of a separate later
+  // Document Collection stage. Same HR-uploads-directly convention as resume/aadhaar, not the
+  // candidate-facing secure-link flow (DocumentCollectionRequest) other employment types use.
+  educationCertificateFileName   String?
+  educationCertificateFileData   String?  @db.LongText
+  educationCertificateUploadedAt DateTime?
+  photoFileName       String?
+  photoFileData       String?            @db.LongText
+  photoUploadedAt     DateTime?
+  // Optional — if HR already has the candidate's PAN on file (captured any time, e.g. during
+  // offline discussion), Mandatory Document Collection skips re-requesting the PAN Card upload.
+  panNumber           String?
+  // HR's manual upload of the candidate's countersigned offer letter — required before Confirm
+  // Acceptance is enabled on the plain-email delivery path (the Adobe Sign path never needs this;
+  // the signed document there comes back automatically through the e-sign completion itself).
+  signedOfferFileName    String?
+  signedOfferFileData    String?         @db.LongText
+  signedOfferUploadedAt  DateTime?
+  role                String
+  designation         String
+  employmentType      EmploymentType     @default(EMPLOYEE)
+  businessUnitId      Int?
+  businessUnit        HrBusinessUnit?    @relation(fields: [businessUnitId], references: [id])
+  countryCode         String             @default("INDIA")
+  ctc                 Float
+  // Set at Stage 1 (Create Candidate) for a CONTRACTOR/INTERN so the "is this genuinely zero-cost"
+  // question is asked once, up front — carried forward to default ServiceAgreement.noCostToCompany
+  // (and from there Employee.noCostToCompany) rather than asking again at the SLA stage.
+  noCostToCompany     Boolean            @default(false)
+  offerDate           DateTime
+  proposedJoiningDate DateTime?
+  // Offer Letter terms (EMPLOYEE only — a CONTRACTOR never generates an Offer Letter) —
+  // set on Generate Offer and editable on Regenerate, never hard-coded in hrPdf.ts.
+  reportingManager    String?
+  workLocation        String?            @default("Office")
+  department          String?
+  employmentBasis     String?            @default("Full Time")
+  probationPeriod     String?            @default("2 Months")
+  noticePeriod        String?            @default("2 Months")
+  acceptanceDeadline  DateTime?
+  // Snapshot of which OnboardingDocumentType names HR selected for THIS offer at generation time
+  // (e.g. ["PAN Card","Aadhar Card"]) — drives the "List of Joining Documents" section on the
+  // generated Offer Letter / Service Agreement. A snapshot, not a live relation, so editing the
+  // master checklist later never silently changes a document already sent to a candidate.
+  documentChecklist   Json?
+  status              OfferStatus        @default(DRAFT)
+  activeVersion       Int                @default(1)
+  // Allocated when the appointment letter (EMPLOYEE) or service agreement (CONTRACTOR) is first
+  // generated; stays invisible to every other module (Employee master, Attendance, Project
+  // Allocation, Cost) until joining is confirmed. EMPLOYEE keeps the "GA-####" format
+  // (nextEmpNo()); CONTRACTOR uses "C1500", "C1501", … (nextContractorCode()).
+  reservedEmpNo       String?
+  sentAt              DateTime?
+  acceptedAt          DateTime?
+  acceptanceMethod    String? // EMAIL_REPLY | SELF_SERVE_LINK | PHONE | SIGNED_COPY
+  acceptanceNote      String?            @db.Text
+  employeeId          Int?               @unique // set once Confirm Joining creates/activates the Employee row
+  employee            Employee?          @relation(fields: [employeeId], references: [id])
+  // Set when Finance rejects the CTC approval Confirm Joining submitted — the Employee row is
+  // removed entirely at that point (never should have gone live before Finance signs off), so
+  // this is the only enduring record of the rejection for Onboarding History to display. Cleared
+  // if the offer is later successfully re-confirmed.
+  ctcRejectedAt       DateTime?
+  ctcRejectionNote    String?            @db.Text
+  createdById         Int?
+  createdAt           DateTime           @default(now())
+  updatedAt           DateTime           @updatedAt
+  versions            OfferVersion[]
+  appointmentLetter   AppointmentLetter?
+  serviceAgreement    ServiceAgreement?
+  itProvisioningRequest ItProvisioningRequest?
+  auditLogs           OfferAuditLog[]
+  documentCollectionRequest DocumentCollectionRequest?
+  // Pinned once, when the offer first needs stage progress (Offer Accepted) — the published
+  // WorkflowDefinition at that moment. Null for offers created before the workflow engine existed,
+  // or before ACCEPTED; engine/workflow.ts falls back to "no stage gating" in that case.
+  workflowId          Int?
+  workflow            WorkflowDefinition? @relation(fields: [workflowId], references: [id])
+  stageProgress       OfferStageProgress[]
+  // Free-form values for HR-defined Custom Fields (Workflow & Stage Configuration -> any stage's
+  // "+ Add Custom Field", no code change needed to add one) — flat {fieldKey: value} map, keyed by
+  // each custom field's own globally-unique key (engine/workflow.ts resolveCustomFieldsForStage).
+  customFields        Json?
+  // ---- US/Canada simplified onboarding (3-stage: Capture Information -> Agreement & Signature ->
+  // Onboarding Activation) — "Compensation" section of Stage 1. All null for India and for US/Canada
+  // Full-Time Salaried engagements, where `ctc` above (annual) is already the whole story. See
+  // engine/workflow.ts's "US_CANADA" workflow bucket (ensureOfferPinnedToWorkflow) for stage gating.
+  usEngagementType      String? // "W2_FULL_TIME" | "W2_NO_BENEFIT" | "VENDOR" (US only; null for Canada/India)
+  billingBasis          String? // "ANNUAL" | "HOURLY" — which of `ctc` vs hourlyRateUsd/hoursPerDay is authoritative
+  hourlyRateUsd         Float?
+  hoursPerDay           Int?
+  // Vendor/Contractor (US "Hired from Vendor", Canada "Contractor") — the staffing Service Provider
+  // and end-client details the MSA/SOW are generated from (see MsaTemplate/SowTemplate below).
+  vendorName            String?
+  vendorEin             String?
+  vendorAddress         String? @db.Text
+  endClientName         String?
+  engagementDescription String? @db.Text
+  // US/Canada Stage 1's "Supporting Documents" — SSN/SIN, Work Authorization/Work Permit, Driver's
+  // License, W-9, Void Cheque, and any HR-named "+ Add Additional Document" entry. A generic table
+  // (not one column pair per type, like Resume/Education Certificate above) specifically because
+  // "Add Additional Document" needs an arbitrary docType/label, which fixed columns can't express.
+  // Same HR-uploads-directly convention as Resume/Education Certificate/Photo — not the
+  // candidate-facing DocumentCollectionRequest/CandidateDocument flow.
+  documents             OfferDocument[]
+
+  @@index([status])
+}
+
+// MSA (Master Service Agreement) template — one per Business Unit (GenAquarius LLC / Aquarius
+// Technologies Limited), used only for US/Canada Vendor/Contractor engagements (Offer.vendorName
+// set). Same plain-text, blank-line-separated, {{placeholder}}-filled body convention as
+// HrOfferTemplate; engine/hrPdf.ts's renderMsaPdf fills it per-offer. Default bodyText (seeded)
+// reproduces the real signed GenAquarius LLC / Tek Staffing 360 Inc MSA clause-for-clause, with the
+// vendor/entity-specific values turned into placeholders.
+model MsaTemplate {
+  id             Int             @id @default(autoincrement())
+  name           String
+  businessUnitId Int?
+  businessUnit   HrBusinessUnit? @relation(fields: [businessUnitId], references: [id])
+  entityName     String // "GenAquarius LLC" | "Aquarius Technologies Limited" — signature block + body references
+  entityAddress  String?         @db.Text
+  governingLaw   String?         @default("the State of California")
+  bodyText       String          @db.Text
+  isDefault      Boolean         @default(false)
+
+  @@index([businessUnitId])
+}
+
+// SOW (Statement of Work) template — the per-placement counterpart to MsaTemplate (consultant name,
+// start date, rate, end-client). Same per-Business-Unit / {{placeholder}} convention.
+model SowTemplate {
+  id             Int             @id @default(autoincrement())
+  name           String
+  businessUnitId Int?
+  businessUnit   HrBusinessUnit? @relation(fields: [businessUnitId], references: [id])
+  entityName     String
+  entityAddress  String?         @db.Text
+  bodyText       String          @db.Text
+  isDefault      Boolean         @default(false)
+
+  @@index([businessUnitId])
+}
+
+// A regenerated offer creates a NEW version and keeps the old one — only `activeVersion`
+// on Offer is ever sent/previewed/current.
+model OfferVersion {
+  id              Int      @id @default(autoincrement())
+  offerId         Int
+  offer           Offer    @relation(fields: [offerId], references: [id], onDelete: Cascade)
+  versionNo       Int
+  ctc             Float
+  bracketName     String
+  salaryBreakup   Json // {partA:[{name,pct,monthly,annual}], partB:[...], grossA, grossFlexi, totalCtc}
+  taxCalc         Json // {grossAnnual, standardDeduction, taxableIncome, tax, cess, totalTax, monthlyTds, netMonthly}
+  offerTemplateId Int?
+  overrides       Json? // employee-specific component overrides for THIS offer only: {componentName:{monthly,annual}}
+  createdById     Int?
+  createdAt       DateTime @default(now())
+
+  @@unique([offerId, versionNo])
+}
+
+model AppointmentLetter {
+  id             Int       @id @default(autoincrement())
+  offerId        Int       @unique
+  offer          Offer     @relation(fields: [offerId], references: [id])
+  empNo          String
+  templateId     Int?
+  dynamicFields  Json
+  clauses        Json
+  issuanceTiming String    @default("ON_JOINING") // ON_JOINING | AFTER_JOINING
+  status         String    @default("DRAFT") // DRAFT | PREVIEWED | ISSUED
+  issuedAt       DateTime?
+  createdAt      DateTime  @default(now())
+  // HR's manual upload of a countersigned copy obtained outside this app (e.g. signed on paper) —
+  // same convention as Offer.signedOfferFileData. Lets HR skip Issue/e-sign entirely and go
+  // straight to Confirm Acceptance when the signed document already exists.
+  signedFileName   String?
+  signedFileData   String?   @db.LongText
+  signedUploadedAt DateTime?
+}
+
+// A "Save & Continue Later" snapshot of the Create Candidate form (Generate Offer, Stage 1) —
+// deliberately separate from Offer itself rather than letting Offer's own required fields go
+// nullable: `formData` is the raw, possibly half-filled client form state as-is, with NO
+// validation, so HR can leave mid-entry at any point and resume exactly where they stopped.
+// Deleted once the real Offer is actually created from it (see POST /offers).
+model OfferDraftSave {
+  id          Int      @id @default(autoincrement())
+  createdById Int
+  label       String?  // best-effort candidate name so far, for the Resume list
+  formData    Json
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+// CONTRACTOR's one and only document — no Offer Letter, no Appointment Letter. 1:1 with Offer,
+// mirroring AppointmentLetter's shape closely. `dynamicFields` holds contractor identity/bank
+// details + the snapshotted `Services` array; `clauses` is a snapshot of the template's clause
+// library at generation time (same pattern as AppointmentLetter.clauses). `status` reuses
+// Offer's own OfferStatus values (DRAFT/GENERATED/PREVIEWED/SENT) rather than a parallel enum.
+model ServiceAgreement {
+  id                  Int         @id @default(autoincrement())
+  offerId             Int         @unique
+  offer               Offer       @relation(fields: [offerId], references: [id])
+  templateId          Int?
+  dynamicFields       Json
+  clauses             Json
+  monthlyCompensation Float
+  // Explicit "No Cost to Company" checkbox (Contractor/Intern) — when true, monthlyCompensation is
+  // stored as 0 and Confirm Joining skips creating any CtcApprovalRequest/CtcRecord for this hire.
+  noCostToCompany     Boolean     @default(false)
+  status              OfferStatus @default(DRAFT)
+  createdAt           DateTime    @default(now())
+  updatedAt           DateTime    @updatedAt
+  // Same manual-upload convention as Offer.signedOfferFileData / AppointmentLetter.signedFileData —
+  // lets HR skip Send/e-sign entirely when a signed copy already exists.
+  signedFileName      String?
+  signedFileData      String?     @db.LongText
+  signedUploadedAt    DateTime?
+}
+
+// Tracks an Adobe Sign agreement sent for one of the three signable HR documents (Offer,
+// AppointmentLetter, ServiceAgreement) — kept as its own table, keyed generically by
+// (docType, docId), rather than adding esign columns to all three document models. The signed
+// PDF itself lands in Attachment (entityType = this row's docType, entityId = docId) once the
+// webhook confirms completion — same "generic entity attachment" convention Client/Project
+// attachments already use, not a new storage mechanism.
+model EsignAgreement {
+  id            Int       @id @default(autoincrement())
+  docType       String    // "OFFER" | "APPOINTMENT_LETTER" | "SERVICE_AGREEMENT"
+  docId         Int
+  agreementId   String    // Adobe Sign's own agreement id
+  signerEmail   String
+  status        String    @default("OUT_FOR_SIGNATURE") // OUT_FOR_SIGNATURE | SIGNED | CANCELLED | DECLINED
+  signedAt      DateTime?
+  confirmedAt   DateTime? // HR's "Confirm Acceptance" step, after previewing the signed document
+  confirmedById Int?
+  createdById   Int?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@unique([docType, docId])
+  @@index([agreementId])
+}
+
+// HR's new-hire IT setup request. EMPLOYEE flow: raised once Mandatory Document Collection is
+// complete (DOC_COLLECTION_COMPLETE), BEFORE Employee Activation — see the 2026-09-23 pipeline
+// reorder note on OfferStatus. CONTRACTOR flow (no document collection stage) raises it once the
+// Service Agreement acceptance is confirmed, same as before. Notifies the IT/Network Admin role
+// (see engine/notify.ts's IT_PROVISIONING_REQUEST flow) with the hardware/OS/email-id request plus
+// the candidate's own already-known details.
+model ItProvisioningRequest {
+  id                  Int       @id @default(autoincrement())
+  offerId             Int       @unique
+  offer               Offer     @relation(fields: [offerId], references: [id])
+  laptopConfiguration String
+  osRequirement       String
+  emailIdToCreate     String
+  phoneNumber         String?
+  // Overrides the address derived from the Offer's own Resident/Permanent Address fields — IT
+  // Admin (or HR, on this same form) can correct it here (e.g. the laptop should ship somewhere
+  // other than what's on file) without touching the candidate's actual Offer record. Null = keep
+  // showing the derived address; once set, this wins.
+  shipToAddress       String?   @db.Text
+  // Same override pattern as shipToAddress above — the Laptop Handover document's Location and
+  // Building rows had no data source at all before activation (Employee.location doesn't exist
+  // yet), and the recipient email had no way to be corrected from the Preview screen. Null = keep
+  // deriving from Employee/Offer as before; once set, these win.
+  locationOverride      String?
+  building              String?
+  handoverEmailOverride String?
+  // RAM is folded into the free-text Laptop Configuration itself (defaults to "16 GB", HR can
+  // edit/extend it) rather than its own separate field (removed after HR feedback).
+  requiredApplications String?  @db.Text
+  requiredAccess       String?  @db.Text
+  otherRequirements    String?  @db.Text
+  // IT Admin's own input (not HR's) — the Microsoft 365 display name, captured on the Pending Task
+  // right before Approve, and carried into the Office 365 Admin email.
+  displayName          String?
+  requestedById       Int?
+  sentAt              DateTime?
+  // IT Admin's own action queue item — completing it (creating the O365 mailbox) triggers the
+  // HR-configurable Welcome Email to the new hire. Separate from `sentAt` (HR's request to IT)
+  // since the two can land days apart.
+  emailCreatedAt      DateTime?
+  emailCreatedById    Int?
+  welcomeEmailSentAt  DateTime?
+  // Laptop Handover email (Helpdesk Settings-managed template) — sent once assets are assigned;
+  // see itAdmin.ts's /tasks/:offerId/laptop-handover routes.
+  laptopHandoverEmailSentAt   DateTime?
+  laptopHandoverEmailSentById Int?
+  // Automated Microsoft Graph provisioning (delegated, IT Admin's own connected account — see
+  // engine/graphAdmin.ts) — set on Approve when Automated Provisioning is enabled. graphUserId
+  // present = the mailbox was actually created via Graph (not just an email notification sent).
+  // temporaryPassword is shown once to IT Admin on the Pending Task's own success screen, never
+  // emailed — same "shown once, never logged" rule as the Helpdesk elevated-access credentials.
+  graphUserId          String?
+  temporaryPassword    String?
+  licenseAssignedSku   String?
+  provisioningError    String?   @db.Text
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+}
+
+// Mandatory Document Collection — after Offer Accepted, HR sends the candidate a secure,
+// unauthenticated link (token below) to upload PAN/Education Certificate/Photo/Salary Slips.
+// One row per Offer; CandidateDocument holds the actual per-document-type status/files. Aadhaar is
+// deliberately never part of this (already captured at Offer Generation — Offer.aadhaarNumber).
+model DocumentCollectionRequest {
+  id          Int      @id @default(autoincrement())
+  offerId     Int      @unique
+  offer       Offer    @relation(fields: [offerId], references: [id], onDelete: Cascade)
+  // Opaque, unguessable — the ONLY credential the candidate's upload page checks (no login).
+  token       String   @unique
+  sentAt      DateTime?
+  sentById    Int?
+  completedAt DateTime? // set once every required document reaches SUBMITTED or later
+  documents   CandidateDocument[]
+  createdAt   DateTime @default(now())
+}
+
+// One row per required document TYPE for a request (not per file — Salary Slips is one row whose
+// `files` array holds all 3 months). `docType` is one of PAN_CARD | EDUCATION_CERTIFICATE | PHOTO |
+// SALARY_SLIPS, but only for types not already satisfied (PAN skipped if Offer/Employee already
+// has one on file — see the exclusion logic in routes/hrms/documentCollection.ts).
+model CandidateDocument {
+  id            Int       @id @default(autoincrement())
+  requestId     Int
+  request       DocumentCollectionRequest @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  docType       String
+  label         String
+  multipleFiles Boolean   @default(false)
+  // Snapshot of the stage's own requiredDocuments[].required at the time this row was created/
+  // reconciled (ensureDocumentCollectionRequest keeps it in sync with the live config) — an
+  // optional document is still offered to upload but never blocks candidate submit, HR's "Move to
+  // Next Stage", or the auto-complete-on-all-verified check (Section: Contractor's Salary Slips).
+  required      Boolean   @default(true)
+  status        String    @default("PENDING") // PENDING | UPLOADED | SUBMITTED | VERIFIED | REJECTED
+  // {fileName, fileData (base64), uploadedAt}[] — a list so Salary Slips (3 files) and any
+  // re-upload history share one shape with the single-file doc types.
+  files         Json      @default("[]")
+  rejectionNote String?
+  verifiedById  Int?
+  verifiedAt    DateTime?
+  updatedAt     DateTime  @updatedAt
+
+  @@unique([requestId, docType])
+}
+
+// US/Canada Stage 1's generic "Supporting Documents" slot — HR uploads directly onto the Offer
+// (no candidate-facing link, no per-type column). `docType` is a fixed key ("SSN_SIN",
+// "WORK_AUTHORIZATION", "DRIVERS_LICENSE", "W9", "VOID_CHEQUE") or "CUSTOM:<slug>" for an
+// HR-typed "+ Add Additional Document" entry — `label` is always the display name shown in the UI.
+model OfferDocument {
+  id         Int      @id @default(autoincrement())
+  offerId    Int
+  offer      Offer    @relation(fields: [offerId], references: [id], onDelete: Cascade)
+  docType    String
+  label      String
+  fileName   String
+  fileData   String   @db.LongText
+  uploadedAt DateTime @default(now())
+
+  @@unique([offerId, docType])
+}
+
+// ===================================================================================
+// HR Workflow Engine — HR Settings -> Workflow & Stage Configuration. Replaces hardcoded stage
+// sequencing: the relative order of Document Collection / IT Provisioning / Employee Activation /
+// Appointment Generation (and any custom stages HR adds) is data, not code. Real app routes
+// (Generate Offer, Send Document Collection Request, IT Provisioning, Confirm Joining, Appointment
+// Generate/Preview/Issue) consult engine/workflow.ts for "is this stage's position satisfied yet"
+// instead of hardcoding e.g. "status must be APPOINTMENT_ISSUED" — see WorkflowStage.stageType.
+// One workflow is PUBLISHED at a time; edits happen on a DRAFT copy (Create New Version) so live
+// candidates are never affected mid-edit. OfferStageProgress pins each offer to the
+// WorkflowDefinition that was published when it started, so an in-progress candidate keeps their
+// original stage list unless HR explicitly migrates them (see Offer.workflowId, appliesTo below).
+model WorkflowDefinition {
+  id            Int      @id @default(autoincrement())
+  name          String   @default("Employee Lifecycle")
+  // EMPLOYEE | CONTRACTOR — separate, independently-configured/published/versioned template per
+  // employment type (HR request: Contractor's real 5-stage pipeline shouldn't share a config
+  // surface with Employee's 7-stage one). Every "one PUBLISHED at a time" rule in
+  // workflowSettings.ts (draft/publish/history) is scoped by this, not global anymore.
+  employmentType String  @default("EMPLOYEE")
+  version       Int
+  status        String   @default("DRAFT") // DRAFT | PUBLISHED | ARCHIVED
+  // Only consulted at publish time — who the newly-published version applies to: brand-new
+  // candidates only, everyone including those mid-workflow on an older version, or (same as
+  // NEW_AND_IN_PROGRESS today) — kept as an explicit field for the UI/audit trail either way.
+  appliesTo     String   @default("NEW_ONLY") // NEW_ONLY | NEW_AND_IN_PROGRESS | ALL
+  // Per-role {view,configure,preview,publish} (Section 29) — null = fall back to the fixed
+  // HR_OPS_ROLES gate (HR/CEO/CTO all-access) every other HR admin page already uses.
+  permissions   Json?
+  publishedAt   DateTime?
+  publishedById Int?
+  createdById   Int?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+  stages        WorkflowStage[]
+  offers        Offer[]
+
+  @@unique([employmentType, version])
+}
+
+model WorkflowStage {
+  id                 Int                @id @default(autoincrement())
+  workflowId         Int
+  workflow           WorkflowDefinition @relation(fields: [workflowId], references: [id], onDelete: Cascade)
+  // Stable within a workflow — system stage types below are looked up BY TYPE (exactly one stage
+  // of a given system stageType per workflow is enforced at the API layer, not the DB), so HR
+  // renaming/reordering a stage never breaks the real action wired to it. Custom stages get a
+  // generated slug and have no attached system behavior beyond manual "Complete Stage".
+  key                String
+  name               String
+  stageType          String             // see engine/workflow.ts STAGE_TYPES for the full list
+  order              Int
+  enabled            Boolean            @default(true)
+  required           Boolean            @default(true)
+  allowSkip          Boolean            @default(false)
+  allowRevisit       Boolean            @default(true)
+  candidateFacing    String             @default("HR_ONLY") // HR_ONLY | CANDIDATE_FACING | BOTH
+  hrApprovalRequired Boolean            @default(false)
+  completionMode     String             @default("MANUAL") // AUTO | MANUAL
+  mandatoryFields    Json               @default("[]") // [{key,label,mandatory}]
+  requiredDocuments  Json               @default("[]") // [{docType,label,required,candidateUpload,hrVerification,allowReupload,multipleFiles,order}]
+  actions            Json               @default("[]") // [{key,label,enabled}]
+  dependsOnKeys      Json               @default("[]") // string[] of other stages' `key` in this workflow
+  notification       Json?              // {sendEmail,templateKey,sendMode,useSecureLink}
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+
+  @@unique([workflowId, key])
+  @@index([workflowId, order])
+}
+
+// Per-offer completion state against the ONE WorkflowDefinition it's pinned to (Offer.workflowId).
+model OfferStageProgress {
+  id            Int       @id @default(autoincrement())
+  offerId       Int
+  offer         Offer     @relation(fields: [offerId], references: [id], onDelete: Cascade)
+  stageKey      String
+  status        String    @default("PENDING") // PENDING | IN_PROGRESS | COMPLETED | SKIPPED
+  completedAt   DateTime?
+  completedById Int?
+  updatedAt     DateTime  @updatedAt
+
+  @@unique([offerId, stageKey])
+}
+
+model OfferAuditLog {
+  id         Int      @id @default(autoincrement())
+  offerId    Int
+  offer      Offer    @relation(fields: [offerId], references: [id], onDelete: Cascade)
+  action     String
+  fromStatus String?
+  toStatus   String?
+  byUserId   Int?
+  note       String?  @db.Text
+  at         DateTime @default(now())
+
+  @@index([offerId, at])
+}
+
+// ----------------------------------------------------------------------------
+// Module Access Matrix — dynamic, DB-driven RBAC. One row per (role, pageKey).
+// `pageKey` matches the client route path (e.g. "/hr", "/employees", "/finance").
+// If this table is EMPTY for a page, the app falls back to that page's hard-coded default
+// role list (see auth/permissions.ts) — so a fresh install / empty table never locks anyone
+// out. Once a CEO/CTO edits the matrix, rows here override the hard-coded defaults.
+model RolePermission {
+  id        Int     @id @default(autoincrement())
+  role      Role
+  moduleKey String // "Executive" | "Finance" | "HR" | "Employee" | "Administration" | "My Work"
+  pageKey   String // e.g. "/hr/offers" — matches the client route path exactly
+  pageLabel String // human label shown in the matrix UI, e.g. "Offers & Lifecycle"
+  allowed   Boolean @default(true)
+
+  @@unique([role, pageKey])
+  @@index([moduleKey])
+}
+
+// ----------------------------------------------------------------------------
+// Employee Self-Service — onboarding documents, leave, attendance.
+// Leave rules are DATA (HrLeaveType rows), configured per country in HR Settings from the
+// GenAquarius Leave Policy — the accrual engine (engine/leave.ts) only reads these, it never
+// hard-codes a quota or accrual rate.
+// ----------------------------------------------------------------------------
+enum LeaveStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+model HrLeaveType {
+  id               Int            @id @default(autoincrement())
+  countryCode      String         @default("INDIA")
+  // null = Country-level default entitlement; set = a Business Unit's own override for this
+  // same leave type/country (see HrBusinessUnit's doc comment for the fallback rule).
+  businessUnitId   Int?
+  businessUnit     HrBusinessUnit? @relation(fields: [businessUnitId], references: [id])
+  key              String // EARNED | GENERAL | BEREAVEMENT | COMP_OFF | PUBLIC_HOLIDAY | BIRTHDAY | MARRIAGE_ANNIVERSARY | FLOATING_RESTRICTED
+  name             String
+  accrualPerMonth  Float          @default(0) // e.g. Earned = 1, General = 0.5
+  annualQuota      Float? // e.g. Birthday = 1, Marriage Anniversary = 1, Floating/Restricted = 1, Public Holiday = 7
+  maxCarryForward  Float? // e.g. Earned = 30
+  maxApplyPerYear  Float? // e.g. General = 3 — applying beyond this is blocked
+  // Per-application consecutive-day cap (e.g. General Leave: a single request cannot span
+  // more than 3 consecutive days) — distinct from maxApplyPerYear (a count of applications).
+  maxConsecutiveDays Int?
+  // Accrual/eligibility only starts once the employee has completed probation (see
+  // HrLeavePolicyConfig.probationDays) — e.g. Earned Leave.
+  requiresProbationComplete Boolean @default(false)
+  lapsesAtYearEnd  Boolean        @default(false) // unused balance is zeroed at calendar year end (e.g. General)
+  sandwichEligible Boolean        @default(false) // subject to the Fri+Mon sandwich-leave rule
+  order            Int            @default(0)
+  balances         LeaveBalance[]
+  requests         LeaveRequest[]
+
+  @@unique([countryCode, businessUnitId, key])
+}
+
+// Global-per-country leave policy knobs that aren't tied to one leave type: the
+// sandwich-leave rule, probation length (drives HrLeaveType.requiresProbationComplete),
+// and Earned-Leave encashment / Comp-Off expiry parameters. One row per country.
+model HrLeavePolicyConfig {
+  id                     Int             @id @default(autoincrement())
+  countryCode            String
+  // null = the Country-level default (one per country, same role the old @unique countryCode
+  // played); set = a Business Unit's own override. Not enforced as a DB-level "only one default
+  // per country" rule (MySQL treats every NULL in a unique index as distinct) — engine/hr.ts's
+  // resolveByBusinessUnit() and the upsert route both key off countryCode+businessUnitId together.
+  businessUnitId         Int?
+  businessUnit           HrBusinessUnit? @relation(fields: [businessUnitId], references: [id])
+  sandwichEnabled        Boolean @default(false)
+  sandwichDays           Int     @default(4) // total days deducted for a Fri+Mon leave (informational; engine derives it)
+  probationDays          Int     @default(90)
+  elEncashmentCapDays    Float   @default(30) // max accumulated EL days encashable at separation
+  elEncashmentRatePerDay Float   @default(2000) // ₹/day — EL beyond the carry-forward cap encashed at year-end
+  compOffExpiryDays      Int     @default(30) // comp-off must be availed within N days of credit
+
+  @@unique([countryCode, businessUnitId])
+}
+
+// A single comp-off credit earned by working a holiday/weekend, granted by HR/admin on
+// approval. Expires `HrLeavePolicyConfig.compOffExpiryDays` days after `creditedAt` — the
+// leave engine consumes the earliest-expiring, non-expired credits first.
+model CompOffCredit {
+  id            Int       @id @default(autoincrement())
+  employeeId    Int
+  employee      Employee  @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  days          Float
+  creditedAt    DateTime  @default(now())
+  expiresAt     DateTime
+  consumedDays  Float     @default(0)
+  note          String?   @db.Text
+  grantedById   Int?
+  createdAt     DateTime  @default(now())
+
+  @@index([employeeId, expiresAt])
+}
+
+model LeaveBalance {
+  id          Int         @id @default(autoincrement())
+  employeeId  Int
+  employee    Employee    @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  leaveTypeId Int
+  leaveType   HrLeaveType @relation(fields: [leaveTypeId], references: [id])
+  year        Int
+  accrued     Float       @default(0)
+  used        Float       @default(0)
+  carriedIn   Float       @default(0) // brought forward from the previous year (capped by maxCarryForward)
+
+  @@unique([employeeId, leaveTypeId, year])
+}
+
+model LeaveRequest {
+  id               Int         @id @default(autoincrement())
+  employeeId       Int
+  employee         Employee    @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  leaveTypeId      Int
+  leaveType        HrLeaveType @relation(fields: [leaveTypeId], references: [id])
+  fromDate         DateTime
+  toDate           DateTime
+  days             Float // total days deducted, INCLUDING any sandwich-rule addition
+  sandwichDeducted Float       @default(0) // the extra days added by the Fri+Mon sandwich rule, for transparency
+  reason           String?     @db.Text
+  status           LeaveStatus @default(PENDING)
+  approvedById     Int?
+  approvedAt       DateTime?
+  createdAt        DateTime    @default(now())
+
+  @@index([employeeId, status])
+}
+
+model AttendanceRecord {
+  id         Int      @id @default(autoincrement())
+  employeeId Int
+  employee   Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  date       DateTime // date-only (time truncated to midnight UTC)
+  status     String   @default("PRESENT") // PRESENT | ABSENT | LEAVE | HOLIDAY | WFH
+  markedAt   DateTime @default(now())
+  // Check-in/out timestamps — additive to the existing daily status marker above (set by
+  // separate POST /ess/attendance/check-in|check-out endpoints; independent of `status`,
+  // which is still set by the original "Mark Present/WFH" flow). Nullable: a day may have a
+  // status marked without a check-in/out (e.g. WFH marked retroactively), or vice versa.
+  checkInTime  DateTime?
+  checkOutTime DateTime?
+
+  @@unique([employeeId, date])
+}
+
+// An employee's request to correct a day's check-in/check-out (e.g. forgot to check in) —
+// requires HR/manager approval (same approver tier as Leave Approvals). On approval, the
+// requested times are written onto the AttendanceRecord for `date`.
+model AttendanceRegularizationRequest {
+  id                Int         @id @default(autoincrement())
+  employeeId        Int
+  employee          Employee    @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  date              DateTime // the attendance date being corrected (UTC midnight, matches AttendanceRecord.date)
+  requestedCheckIn  DateTime?
+  requestedCheckOut DateTime?
+  reason            String      @db.Text
+  // Batch-apply extras (Regularization & Permission screen): shared request-level remarks and
+  // the CC list (comma-separated emails) notified when the request is raised.
+  remarks           String?     @db.Text
+  ccEmails          String?     @db.Text
+  status            LeaveStatus @default(PENDING)
+  reviewedById      Int?
+  reviewedAt        DateTime?
+  createdAt         DateTime    @default(now())
+
+  @@index([employeeId, status])
+}
+
+// A short-duration "leave X to Y early/late" request, distinct from a full leave day —
+// same create/approve/reject shape as regularization, same approver tier as Leave Approvals.
+model PermissionRequest {
+  id           Int         @id @default(autoincrement())
+  employeeId   Int
+  employee     Employee    @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  date         DateTime
+  fromTime     String // "HH:MM"
+  toTime       String // "HH:MM"
+  // LATE_COMING | EARLY_GOING | PERSONAL_WORK | OFFICIAL_DUTY | CLIENT_VISIT — see
+  // PERMISSION_TYPES in routes/ess.ts. Null for rows raised before types existed.
+  permissionType String?
+  reason       String      @db.Text
+  remarks      String?     @db.Text
+  ccEmails     String?     @db.Text
+  status       LeaveStatus @default(PENDING)
+  reviewedById Int?
+  reviewedAt   DateTime?
+  createdAt    DateTime    @default(now())
+
+  @@index([employeeId, status])
+}
+
+// Joining-documents checklist — seeded from Annexure B ("List of Joining Documents").
+model OnboardingDocumentType {
+  id             Int                          @id @default(autoincrement())
+  name           String // e.g. "PAN Card", "Aadhar Card" — unique per Business Unit, not globally,
+  // now that a BU can define its own checklist (null = the global default list).
+  businessUnitId Int?
+  businessUnit   HrBusinessUnit?              @relation(fields: [businessUnitId], references: [id])
+  required       Boolean                      @default(true)
+  order          Int                          @default(0)
+  documents      EmployeeOnboardingDocument[]
+
+  @@unique([name, businessUnitId])
+}
+
+// HR-configurable catalog of "Additional Profile" fields (Personal/Address/Bank/PF/KYC) — HR
+// Settings manages this list (add/edit/reorder/enable/require); the Employee Dashboard's
+// Additional Details form and HR's review screen both render from it, so the field set is never
+// hardcoded. Education/Family/Nomination are separate repeating-list sections on the submission
+// itself (EmployeeProfileSubmission), not part of this flat catalog.
+model EmployeeProfileFieldConfig {
+  id             Int             @id @default(autoincrement())
+  section        String // PERSONAL | ADDRESS | BANK | PF | KYC
+  key            String // stable machine key, e.g. "bloodGroup" — never shown to users
+  label          String
+  fieldType      String // TEXT | DATE | SELECT | BOOLEAN | NUMBER
+  options        Json? // string[] — only for SELECT
+  required       Boolean         @default(false)
+  order          Int             @default(0)
+  enabled        Boolean         @default(true)
+  // null = the India/company-wide default list (unchanged, pre-existing rows); a specific BU
+  // (e.g. US & Canada) can get its own independent field set, same null-fallback convention as
+  // HrEmailTemplate/OnboardingDocumentType.
+  businessUnitId Int?
+  businessUnit   HrBusinessUnit? @relation(fields: [businessUnitId], references: [id])
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  @@unique([key, businessUnitId])
+}
+
+// One row per employee (enforced by @@unique on employeeId, never duplicated) — the employee's
+// own Additional Details submission, resubmittable (overwrites in place, no history) until HR
+// approves it. `values` holds the flat EmployeeProfileFieldConfig-driven fields; education/family/
+// nomination are their own fixed-shape repeating lists.
+model EmployeeProfileSubmission {
+  id           Int       @id @default(autoincrement())
+  employeeId   Int       @unique
+  employee     Employee  @relation(fields: [employeeId], references: [id])
+  values       Json // { [fieldKey]: string | boolean | number }
+  education    Json? // [{ institution, degree, fieldOfStudy, yearOfCompletion }]
+  family       Json? // [{ name, relation, dateOfBirth, gender }]
+  nomination   Json? // [{ name, relation, percentage }]
+  status       String    @default("PENDING") // PENDING | APPROVED | REJECTED
+  submittedAt  DateTime  @default(now())
+  reviewedById Int?
+  reviewedAt   DateTime?
+  reviewNote   String?   @db.Text
+  updatedAt    DateTime  @updatedAt
+}
+
+model EmployeeOnboardingDocument {
+  id           Int                    @id @default(autoincrement())
+  employeeId   Int
+  employee     Employee               @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  docTypeId    Int
+  docType      OnboardingDocumentType @relation(fields: [docTypeId], references: [id])
+  fileName     String?
+  fileData     String?                @db.LongText // base64 — same small-file pattern as Client.logo
+  status       String                 @default("PENDING") // PENDING | SUBMITTED | APPROVED | REJECTED
+  submittedAt  DateTime?
+  reviewedById Int?
+  reviewedAt   DateTime?
+  note         String?                @db.Text
+
+  @@unique([employeeId, docTypeId])
+}
+
+// Explicit, PM/CTO-assigned employee action (e.g. "submit your timesheet") shown as a pending-
+// action badge on the Employee Dashboard until resolved — distinct from the onboarding-document
+// checklist, which is always derived live from EmployeeOnboardingDocument.status rather than
+// tracked here, since HR assigning the checklist at offer generation already IS its own trigger
+// and there's no risk of this table's state drifting out of sync with the real document status.
+model EmployeeAction {
+  id           Int       @id @default(autoincrement())
+  employeeId   Int
+  employee     Employee  @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  type         String // "TIMESHEET" (extensible to future ad-hoc action types)
+  status       String    @default("OPEN") // OPEN | CLOSED
+  periodMonth  Int? // which Timesheet period this nudge targets, when type = TIMESHEET
+  periodYear   Int?
+  note         String?   @db.Text
+  assignedById Int?
+  assignedAt   DateTime  @default(now())
+  closedAt     DateTime?
+
+  @@index([employeeId, status])
+}
+
+// Dedup guard for daily pending-action reminder emails (onboarding docs, timesheet nudges, …) —
+// the app restarts often (deploys, the nightly auto-shutdown), and a plain setInterval like
+// rotateAuditLog's would otherwise re-fire on every boot within the same day and spam employees.
+// One row per (employee, action type, calendar day) actually reminded.
+model ReminderLog {
+  id         Int      @id @default(autoincrement())
+  employeeId Int
+  actionType String // "ONBOARDING_DOCS" | "TIMESHEET"
+  sentDate   String // "YYYY-MM-DD", server-local date the reminder was sent
+  // Which reminder-of-the-day this was, e.g. "09:00" — lets a flow configured for multiple times
+  // a day (Notification Settings' cadence config) send more than once without re-triggering the
+  // same slot twice on a restart. Non-cadence flows (or legacy rows) use the fixed value "1".
+  slot       String   @default("1")
+  sentAt     DateTime @default(now())
+
+  @@unique([employeeId, actionType, sentDate, slot])
+}
+
+// Per-flow email notification control — Administration → Notification Settings. `flowKey` matches
+// a key in engine/notificationFlows.ts's static catalog (the source of truth for what flows exist,
+// their labels/descriptions/category — this table only holds the admin's per-flow overrides, so a
+// flow with no row here is simply "enabled, default CC pool, nothing excluded").
+model NotificationSetting {
+  flowKey String @id
+  enabled Boolean @default(true)
+  // Default CC pool for every flow is "everyone currently in FINANCE or HR" (live, not a snapshot —
+  // a new Finance/HR hire is automatically included everywhere without touching this table). This
+  // is the list of user ids UNCHECKED for this one flow, i.e. excluded from that live pool — not a
+  // fixed allow-list, so it survives people joining/leaving Finance/HR without going stale.
+  ccExcludedUserIds Json @default("[]")
+  // Cadence config — only meaningful for the two reminder-style flows (TIMESHEET_REMINDER,
+  // ONBOARDING_DOC_REMINDER). A JSON array of "HH:mm" (server-local, 24h) send times; the
+  // reminder scheduler (engine/reminders.ts) ticks every 15 min and fires whichever configured
+  // flow has a time matching the current slot. Null/empty = the flow's built-in default (once,
+  // 09:00) for a cadence-capable flow, or simply unused for a non-cadence flow.
+  reminderTimes Json?
+  updatedAt DateTime @updatedAt
+}
+
+// =====================================================================================
+// IT Helpdesk — employee-facing ticketing (incidents, asset requests, elevated-access
+// requests all share HelpdeskTicket, distinguished by `type`; type-specific fields live in
+// `details`), an IT asset inventory with assignment, a requestable asset catalog and a
+// knowledge base. People are referenced by plain ids (resolved on read) so none of the
+// existing User/Employee models change. Managed from IT Admin → Helpdesk Console.
+// =====================================================================================
+model HelpdeskTicket {
+  id              Int       @id @default(autoincrement())
+  type            String    @default("INCIDENT") // INCIDENT | ASSET_REQUEST | ELEVATED_ACCESS
+  requesterUserId Int
+  employeeId      Int?
+  category        String // Hardware | Software | Network | Email & O365 | Access | Asset | Other
+  priority        String    @default("MEDIUM") // LOW | MEDIUM | HIGH | CRITICAL
+  subject         String
+  description     String    @db.Text
+  details         Json? // ASSET_REQUEST: { catalogItemId, itemName, quantity, neededBy } · ELEVATED_ACCESS: { system, accessLevel, durationHours, startAt, device }
+  // PENDING_MANAGER (asset / elevated-access requests waiting on the reporting manager) →
+  // OPEN | IN_PROGRESS | ON_HOLD → RESOLVED (fulfilled / granted) | CLOSED | REJECTED | CANCELLED
+  status          String    @default("OPEN")
+  // Manager approval step — reporting manager resolved from Employee.reportingManager at creation.
+  approvalStatus    String?   // PENDING | APPROVED | REJECTED | NOT_REQUIRED (null for plain incidents)
+  managerEmployeeId Int?
+  managerDecisionById Int? // User id of whoever approved/rejected
+  managerDecisionAt DateTime?
+  managerNote       String?   @db.Text
+  rejectedBy        String?   // MANAGER | IT — drives "Rejected by Manager / IT Support"
+  assignedToId    Int? // User id of the IT agent
+  resolution      String?   @db.Text
+  attachmentName  String?
+  attachmentData  String?   @db.LongText // base64
+  resolvedAt      DateTime?
+  closedAt        DateTime?
+  // Unread-count watermarks — POST /tickets/:id/mark-read bumps whichever side just opened the
+  // ticket. itLastReadAt is shared across every IT Admin (one ticket, one queue, same "read"
+  // convention already used by assignedToId being single-owner) rather than tracked per agent.
+  requesterLastReadAt DateTime?
+  itLastReadAt        DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  comments        HelpdeskComment[]
+
+  @@index([requesterUserId, status])
+  @@index([status, type])
+  @@index([managerEmployeeId, approvalStatus])
+}
+
+model HelpdeskComment {
+  id             Int            @id @default(autoincrement())
+  ticketId       Int
+  ticket         HelpdeskTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  authorUserId   Int
+  authorName     String
+  body           String         @db.Text
+  isInternal     Boolean        @default(false) // IT-only note, hidden from the requester
+  // Same base64 convention as HelpdeskTicket's own top-level attachment — a chat message (from
+  // either the requester or IT) may carry one file. IT's own standalone "upload to the ticket"
+  // action (item 2 of the spec) is just a comment with an empty/default body and an attachment —
+  // one storage mechanism for both cases rather than two.
+  attachmentName String?
+  attachmentData String?        @db.LongText
+  createdAt      DateTime       @default(now())
+
+  @@index([ticketId])
+}
+
+model AssetCatalogItem {
+  id               Int      @id @default(autoincrement())
+  name             String
+  category         String // Peripheral | Monitor | Laptop | Accessory | Software | Mobile
+  description      String?  @db.Text
+  icon             String? // emoji shown on the catalog card
+  requiresApproval Boolean  @default(false)
+  active           Boolean  @default(true)
+  order            Int      @default(0)
+  createdAt        DateTime @default(now())
+}
+
+model ItAsset {
+  id                 Int       @id @default(autoincrement())
+  assetTag           String    @unique
+  name               String
+  category           String
+  make               String?
+  model              String?
+  serialNo           String?
+  status             String    @default("IN_STOCK") // IN_STOCK | ASSIGNED | IN_REPAIR | RETIRED | MISSING
+  assignedEmployeeId Int?
+  assignedAt         DateTime?
+  assignedById       Int? // User id of the IT Admin who performed the assignment
+  purchaseDate       DateTime?
+  warrantyTill       DateTime?
+  notes              String?   @db.Text
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+  history            ItAssetAssignmentHistory[]
+  collectionItems    ItAssetCollectionItem[]
+
+  @@index([assignedEmployeeId])
+}
+
+// Configurable catalog of Intune/Entra security groups offered on the Pending Tasks "Group
+// Assignment Checklist" (onboarding Approve) and Offboarding "Deactivation Checklist" (group
+// removal) — Admin Settings manages this list; `name` must exactly match the group's real Entra
+// displayName (used to resolve it via Graph's findGroupByName at checklist-confirm time).
+model ItGroupDef {
+  id        Int      @id @default(autoincrement())
+  name      String // exact Entra/Intune group displayName
+  scope     String   @default("BOTH") // "ONBOARDING" | "OFFBOARDING" | "BOTH"
+  enabled   Boolean  @default(true)
+  order     Int      @default(0)
+  createdAt DateTime @default(now())
+}
+
+// One row per assign→return cycle — the fields on ItAsset itself only ever hold the CURRENT
+// assignment (overwritten on every reassign/return), so this is the only place the full lifecycle
+// (every previous employee, assignment/return dates, and why it was returned) survives. Never
+// updated except to close it out on return (returnedAt/By/Remark) — a reassignment always opens a
+// brand new row rather than reusing or overwriting an old one.
+model ItAssetAssignmentHistory {
+  id           Int       @id @default(autoincrement())
+  assetId      Int
+  asset        ItAsset   @relation(fields: [assetId], references: [id])
+  employeeId   Int
+  assignedAt   DateTime
+  assignedById Int?
+  returnedAt   DateTime?
+  returnedById Int?
+  returnRemark String?   @db.Text
+  createdAt    DateTime  @default(now())
+
+  @@index([assetId])
+  @@index([employeeId])
+}
+
+// Created automatically the moment an offboarding "Deactivate Account" completes — one per
+// offboarding, snapshotting every asset the employee held AT THAT MOMENT (ItAssetCollectionItem
+// rows), so later changes to the underlying ItAsset (e.g. someone else reassigning it by mistake)
+// never silently add/remove what this specific collection run is tracking. Stays PENDING until IT
+// Admin runs "Receive Asset Collection", which resolves every item to RECEIVED or MISSING and
+// closes the task out.
+model ItAssetCollectionTask {
+  id                   Int                   @id @default(autoincrement())
+  offboardingRequestId Int                   @unique
+  offboardingRequest   ItOffboardingRequest  @relation(fields: [offboardingRequestId], references: [id])
+  employeeId           Int
+  employee             Employee              @relation(fields: [employeeId], references: [id])
+  status               String                @default("PENDING") // PENDING | RECEIVED
+  expectedDate         DateTime? // IT Admin's own expected Asset Submission/Collection Date
+  reminderSentAt       DateTime? // set once an overdue reminder goes out — never resent after
+  processedAt          DateTime?
+  processedById        Int?
+  createdAt            DateTime              @default(now())
+  items                ItAssetCollectionItem[]
+
+  @@index([employeeId])
+}
+
+// One row per asset snapshotted onto a collection task — `result` stays null until Receive Asset
+// Collection resolves it to RECEIVED or MISSING (with an optional remark, required for MISSING in
+// practice at the route level). Never deleted/reused across tasks — a second offboarding of the
+// same employee (rehire → exit again) gets its own fresh task and fresh item rows.
+model ItAssetCollectionItem {
+  id      Int                   @id @default(autoincrement())
+  taskId  Int
+  task    ItAssetCollectionTask @relation(fields: [taskId], references: [id])
+  assetId Int
+  asset   ItAsset               @relation(fields: [assetId], references: [id])
+  result  String? // null (pending) | RECEIVED | MISSING
+  remark  String?               @db.Text
+
+  @@index([taskId])
+  @@index([assetId])
+}
+
+model KbArticle {
+  id          Int      @id @default(autoincrement())
+  title       String
+  category    String
+  summary     String?  @db.Text
+  body        String?  @db.LongText // optional notes; the document itself is the file below
+  fileName    String?
+  fileSize    Int?
+  fileData    String?  @db.LongText // base64 (PDF / DOCX / etc.) — read & download only for employees
+  tags        String?
+  published   Boolean  @default(true)
+  views       Int      @default(0)
+  createdById Int?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+// Single settings row for the Helpdesk module (Admin Settings -> Helpdesk Console -> Settings) —
+// SLA policy per priority, category/asset-type lists, whether manager approval is required per
+// request type, and the elevated-access max duration all become admin-editable instead of fixed
+// constants in code. id is always 1 (singleton), created on first read if missing.
+model HelpdeskSetting {
+  id                      Int      @id @default(1)
+  slaHours                Json     @default("{\"LOW\":72,\"MEDIUM\":24,\"HIGH\":8,\"CRITICAL\":4}")
+  categories              Json?    // string[] — null = built-in default list
+  assetTypes              Json?    // string[] — null = built-in default list
+  managerApprovalRequired Json     @default("{\"ASSET_REQUEST\":true,\"ELEVATED_ACCESS\":true}")
+  elevatedAccessMaxDays   Int      @default(7)
+  // Display-only stage relabeling per request type — {INCIDENT:{OPEN:"Open",...}, ...}. The
+  // internal status key never changes (stable, per spec's "separate internal key from display
+  // label"), only the text shown to users.
+  stageLabels             Json?
+  // Real, server-enforced permission toggles per request type — see engine defaults in
+  // routes/itsm/helpdesk.ts PERMISSION_DEFAULTS. Not a full RBAC matrix: only the toggles that
+  // actually gate a real code path, so nothing here is decorative.
+  permissions             Json?
+  // Field-level show/hide toggles for the real Raise Ticket / Request an Asset / Elevated Access
+  // forms — see FIELD_DEFAULTS in routes/itsm/helpdesk.ts. Every toggle here is wired into the
+  // actual form component, not decorative.
+  fields                  Json?
+  // Admin-editable display label per toggleable field (e.g. rename "Priority" to "Urgency") —
+  // see DEFAULT_FIELD_LABELS in routes/itsm/helpdesk.ts.
+  fieldLabels             Json?
+  // Admin-defined custom fields per request type — {INCIDENT:[{key,label,fieldType,required}],...}.
+  // Rendered generically (no arbitrary code), captured into HelpdeskTicket.details.customFieldValues
+  // at creation. See routes/itsm/helpdesk.ts customFieldsFor().
+  customFields             Json?
+  updatedById             Int?
+  updatedAt               DateTime @updatedAt
+}
+
+// HR Settings -> Company Settings -> Date & Time Format. One company-wide choice (not
+// per-user/per-BU) — see engine/dateFormat.ts (server) and client/src/dateFormat.ts (the UI
+// mirror), both of which cache this and apply it to EVERY date display and generated document.
+model CompanyDateTimeSetting {
+  id             Int      @id @default(1)
+  dateFormat     String   @default("MMM_D_ORD_YYYY") // key into DATE_FORMATS — see engine/dateFormat.ts
+  timeFormat     String   @default("H12") // "H12" | "H24"
+  updatedById    Int?
+  updatedAt      DateTime @updatedAt
+}

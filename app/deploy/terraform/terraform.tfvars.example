@@ -1,0 +1,13 @@
+# Copy to terraform.tfvars and fill in. Do NOT commit terraform.tfvars.
+subscription_id      = "00000000-0000-0000-0000-000000000000"
+location             = "Central India"
+prefix               = "ga-costing-test"   # must make a globally-unique <prefix>.azurewebsites.net
+mysql_admin_user     = "costadmin"
+mysql_admin_password = "Change-Me-Str0ng!"  # >=8 chars, mixed case + number + symbol
+blocked_signin_roles = "EMPLOYEE,PROJECT_MANAGER"
+
+# DB access lockdown — only YOUR laptop IP may reach MySQL (curl https://ifconfig.me)
+my_client_ip             = "203.0.113.10"
+# Your genaquarius.com identity to become the MySQL Entra admin (open DB with a token, not a password)
+entra_db_admin_login     = "sandeep.minocha@genaquarius.com"
+entra_db_admin_object_id = "00000000-0000-0000-0000-000000000000" # az ad user show --id <upn> --query id -o tsv
